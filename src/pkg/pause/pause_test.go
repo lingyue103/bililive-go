@@ -2,6 +2,7 @@ package pause
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -101,6 +102,40 @@ func TestWrapTransportAbortsInflightRequest(t *testing.T) {
 		t.Logf("在途请求已被立即掐断：耗时 %v，错误=%v", elapsed, err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("Pause 后 5 秒仍未中断在途请求")
+	}
+}
+
+// TestWrapTransportKeepsBodyReadable 验证请求成功后，响应体在整个读取期间都可正常读取。
+//
+// 这是一个曾经存在的缺陷：若在 RoundTrip 返回时就直接 cancel，
+// 调用方随后读取 resp.Body 会因 ctx 已取消而被传输层中断
+// （小体积响应因为已进入缓冲区才侥幸正常，慢响应/大响应则会失败）。
+func TestWrapTransportKeepsBodyReadable(t *testing.T) {
+	g := NewGate()
+	oldGate := defaultGate
+	defaultGate = g
+	defer func() { defaultGate = oldGate }()
+
+	const payload = "hello-body-must-be-readable-0123456789abcdefghijklmnopqrstuvwxyz"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(payload))
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Transport: WrapTransport(http.DefaultTransport)}
+	resp, err := client.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("读取响应体失败（说明 ctx 被过早取消）: %v", err)
+	}
+	if string(body) != payload {
+		t.Fatalf("响应体内容不符: got %q want %q", string(body), payload)
 	}
 }
 

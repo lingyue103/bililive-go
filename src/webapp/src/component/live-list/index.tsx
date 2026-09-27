@@ -1,6 +1,6 @@
 import React from "react";
-import { Alert, Button, Divider, Dropdown, Modal, Table, Tag, Tabs, Row, Col, Tooltip, message, List, Typography, Switch, Space, Popconfirm, Select, Spin } from 'antd';
-import { EditOutlined, SyncOutlined, CloudSyncOutlined, ReloadOutlined, SwapOutlined, CheckCircleOutlined, ExclamationCircleOutlined, CommentOutlined } from '@ant-design/icons';
+import { Alert, Button, Checkbox, Divider, Dropdown, Input, Modal, Popover, Table, Tag, Tabs, Row, Col, Tooltip, message, List, Typography, Switch, Space, Popconfirm, Select, Spin } from 'antd';
+import { EditOutlined, SyncOutlined, CloudSyncOutlined, ReloadOutlined, SwapOutlined, CheckCircleOutlined, ExclamationCircleOutlined, CommentOutlined, SettingOutlined } from '@ant-design/icons';
 import PopDialog from '../pop-dialog/index';
 import BatchAddRoomDialog from '../batch-add-room-dialog/index';
 import LogPanel from '../log-panel/index';
@@ -288,6 +288,89 @@ const StreamListWithFilter: React.FC<StreamListWithFilterProps> = ({
 // 使用动态获取的刷新间隔
 const getRefreshTime = () => getPollIntervalMs();
 
+// ==================== 列设置（自由开关每一列）相关常量 ====================
+
+// 可以在「列设置」面板里自由开关的列 key，与 this.columns / this.smallColumns 里的 key 一一对应：
+//   name              -> 主播名称
+//   room              -> 直播间名称（仅桌面端 columns 才有）
+//   address           -> 直播平台（仅桌面端 columns 才有）
+//   addedAt           -> 添加链接时间
+//   lastStartTimeUnix -> 最近一次直播时间
+//   folderSize        -> 文件夹大小
+//   tags              -> 运行状态
+const SWITCHABLE_COLUMN_KEYS: string[] = [
+    'name',
+    'room',
+    'address',
+    'addedAt',
+    'lastStartTimeUnix',
+    'folderSize',
+    'tags',
+];
+
+// 「操作」列的 key：它不参与列设置，必须始终显示，否则用户无法操作任何直播间
+const ALWAYS_VISIBLE_COLUMN_KEY = 'action';
+
+// 列 key -> 列设置面板里展示的中文名称
+const COLUMN_KEY_LABELS: { [key: string]: string } = {
+    name: '主播名称',
+    room: '直播间名称',
+    address: '直播平台',
+    addedAt: '添加链接时间',
+    lastStartTimeUnix: '最近一次直播时间',
+    folderSize: '文件夹大小',
+    tags: '运行状态',
+};
+
+// 列显示设置的 localStorage key
+const VISIBLE_COLUMNS_STORAGE_KEY = 'liveListVisibleColumns';
+
+// 生成「模糊搜索」筛选面板（主播名称 / 直播间名称两列共用，避免重复代码）。
+// 用自定义 filterDropdown 而不是 filters + filterSearch，因为这里要的是输入即匹配的模糊搜索；
+// 搜索状态由 antd 自己维护（selectedKeys -> onFilter），不需要手动传 filteredValue。
+const createFuzzyFilterDropdown = (placeholder: string) => {
+    // 返回 antd 列定义需要的 filterDropdown 渲染函数
+    return ({ setSelectedKeys, selectedKeys, confirm, clearFilters }: any) => (
+        <div style={{ padding: 8 }}>
+            <Input
+                placeholder={placeholder}
+                value={(selectedKeys[0] as string) || ''}
+                onChange={e => setSelectedKeys(e.target.value ? [e.target.value] : [])}
+                onPressEnter={() => confirm()}
+                style={{ width: 200, marginBottom: 8, display: 'block' }}
+            />
+            <Space>
+                <Button type="primary" size="small" onClick={() => confirm()}>搜索</Button>
+                <Button size="small" onClick={() => { if (clearFilters) { clearFilters(); } confirm(); }}>重置</Button>
+            </Space>
+        </div>
+    );
+};
+
+// 从 localStorage 读取用户保存的列显示设置。
+// 读取失败、内容非法、或过滤后一列都不剩时，一律回退为「全部可见」。
+const loadVisibleColumnKeys = (): string[] => {
+    try {
+        const saved = localStorage.getItem(VISIBLE_COLUMNS_STORAGE_KEY);
+        if (saved) {
+            const parsed = JSON.parse(saved);
+            if (Array.isArray(parsed)) {
+                // 只保留仍然合法的列 key，避免历史数据或手工改 localStorage 造成脏值
+                const valid = parsed
+                    .map((key: any) => String(key))
+                    .filter((key: string) => SWITCHABLE_COLUMN_KEYS.includes(key));
+                if (valid.length > 0) {
+                    return valid;
+                }
+            }
+        }
+    } catch (e) {
+        console.error('加载列显示设置失败:', e);
+    }
+    // 默认全部可见
+    return [...SWITCHABLE_COLUMN_KEYS];
+};
+
 interface Props {
     navigate: NavigateFunction;
     refresh?: () => void;
@@ -325,6 +408,7 @@ interface IState {
     recordScheduleDialogVisible: boolean, // 需求6：录制时间段配置弹窗是否可见
     recordScheduleRoomIds: string[], // 需求6：录制时间段配置弹窗作用的直播间 id 列表（支持批量）
     folderSizeRefreshing: boolean, // 需求3：文件夹大小手动刷新中
+    visibleColumnKeys: string[], // 列设置：当前可见的列 key 列表（不含始终显示的「操作」列），默认全部可见
 }
 
 interface ItemData {
@@ -371,6 +455,11 @@ class LiveList extends React.Component<Props, IState> {
 
     //倒计时定时器
     countdownTimer!: NodeJS.Timeout;
+
+    // 列表 Table 的实例引用。
+    // 虚拟滚动下只有可视区域附近的行在 DOM 里，未渲染的行用 getElementById 取不到，
+    // 因此深度链接定位行要改用 Table 实例的 scrollTo({ key })（rc-table/virtual-list 支持按 key 定位）。
+    private tableRef = React.createRef<any>();
 
     runStatus: ColumnsType<ItemData>[number] = {
         title: '运行状态',
@@ -698,12 +787,25 @@ class LiveList extends React.Component<Props, IState> {
             sorter: (a: ItemData, b: ItemData) => {
                 return a.name.localeCompare(b.name);
             },
+            // 需求：主播名称列的表头支持「模糊搜索」（见 createFuzzyFilterDropdown）
+            filterDropdown: createFuzzyFilterDropdown('搜索主播名称'),
+            // 模糊匹配：忽略大小写、支持中文（includes 子串匹配）
+            onFilter: (value: any, record: ItemData) =>
+                String(record.name || '').toLowerCase().includes(String(value).toLowerCase()),
             render: (name: string) => <span>{name}</span>
         },
         {
             title: '直播间名称',
             dataIndex: 'room',
             key: 'room',
+            // 需求：直播间名称列同样提供模糊搜索（匹配的是 record.room.roomName，不是整个 room 对象）
+            // 该列原本没有 sorter，这里只增加筛选入口，不影响其他列排序
+            filterDropdown: createFuzzyFilterDropdown('搜索直播间名称'),
+            // 模糊匹配房间名；record.room 理论上始终存在，这里仍做一次防御，避免脏数据导致渲染期报错
+            onFilter: (value: any, record: ItemData) => {
+                const roomName = (record.room && record.room.roomName) || '';
+                return roomName.toLowerCase().includes(String(value).toLowerCase());
+            },
             render: (room: Room) => (
                 <span>
                     <a href={room.url} rel="noopener noreferrer" target="_blank" onClick={(e) => e.stopPropagation()}>{room.roomName}</a>
@@ -737,6 +839,10 @@ class LiveList extends React.Component<Props, IState> {
             title: '主播名称',
             dataIndex: 'name',
             key: 'name',
+            // 需求：移动端（小屏）的主播名称列同样提供模糊搜索，与桌面端保持一致
+            filterDropdown: createFuzzyFilterDropdown('搜索主播名称'),
+            onFilter: (value: any, record: ItemData) =>
+                String(record.name || '').toLowerCase().includes(String(value).toLowerCase()),
             render: (name: string, data: ItemData) => (
                 <span>
                     <a href={data.room.url} rel="noopener noreferrer" target="_blank" onClick={(e) => e.stopPropagation()}>{name}</a>
@@ -833,6 +939,8 @@ class LiveList extends React.Component<Props, IState> {
             recordScheduleDialogVisible: false,
             recordScheduleRoomIds: [],
             folderSizeRefreshing: false,
+            // 列设置：从 localStorage 恢复用户上次的列显隐选择，读不到则全部可见
+            visibleColumnKeys: loadVisibleColumnKeys(),
         }
     }
 
@@ -1340,16 +1448,25 @@ class LiveList extends React.Component<Props, IState> {
 
                     // 处理深度链接自动展开
                     if (this.pendingRoomId) {
-                        const targetRoom = data.find(item => item.roomId === this.pendingRoomId);
+                        // 先取出到局部变量：下面会立即把 this.pendingRoomId 置空，
+                        // 而 setTimeout 回调是 500ms 后才执行，闭包里再读 this.pendingRoomId 只会拿到 null
+                        const pendingRoomId = this.pendingRoomId;
+                        const targetRoom = data.find(item => item.roomId === pendingRoomId);
                         if (targetRoom) {
-                            if (!this.state.expandedRowKeys.includes(this.pendingRoomId)) {
-                                this.toggleExpandRow(this.pendingRoomId);
+                            if (!this.state.expandedRowKeys.includes(pendingRoomId)) {
+                                this.toggleExpandRow(pendingRoomId);
                             }
-                            // 滚动到该行
+                            // 滚动到该行。
+                            // 虚拟滚动下目标行可能不在已渲染的窗口里（getElementById 会拿到 null），
+                            // 所以这里优先用 Table 实例的 scrollTo({ key }) 让虚拟列表滚动到目标行；
+                            // 若该行恰好已渲染，再补一个高亮 class 作视觉提示。
                             setTimeout(() => {
-                                const element = document.getElementById(`row-live-${this.pendingRoomId}`);
+                                const table: any = this.tableRef.current;
+                                if (table && typeof table.scrollTo === 'function') {
+                                    table.scrollTo({ key: pendingRoomId });
+                                }
+                                const element = document.getElementById(`row-live-${pendingRoomId}`);
                                 if (element) {
-                                    element.scrollIntoView({ behavior: 'smooth', block: 'center' });
                                     element.classList.add('highlight-row'); // 可以添加 CSS 动画
                                 }
                             }, 500);
@@ -1425,6 +1542,67 @@ class LiveList extends React.Component<Props, IState> {
         });
     };
 
+    // ==================== 列设置：自由开关每一列 ====================
+
+    // 把当前可见列写回 localStorage（持久化失败不影响界面）
+    saveVisibleColumnKeys = (keys: string[]) => {
+        try {
+            localStorage.setItem(VISIBLE_COLUMNS_STORAGE_KEY, JSON.stringify(keys));
+        } catch (e) {
+            console.error('保存列显示设置失败:', e);
+        }
+    };
+
+    // Checkbox 组变化：勾选显示 / 取消隐藏某一列。
+    // 约束：至少保留一列可切换列，全部取消时直接拦截并提示（不允许把表格变成空表）。
+    handleVisibleColumnsChange = (checkedValues: any) => {
+        const keys = (Array.isArray(checkedValues) ? checkedValues : []).map((key: any) => String(key));
+        if (keys.length === 0) {
+            message.warning('至少要保留一列，不能把所有列都隐藏');
+            return;
+        }
+        this.setState({ visibleColumnKeys: keys });
+        this.saveVisibleColumnKeys(keys);
+    };
+
+    // 「全选」：所有可切换列全部显示
+    handleSelectAllColumns = () => {
+        const keys = [...SWITCHABLE_COLUMN_KEYS];
+        this.setState({ visibleColumnKeys: keys });
+        this.saveVisibleColumnKeys(keys);
+    };
+
+    // 「重置」：恢复默认（默认即全部可见）
+    handleResetColumns = () => {
+        const keys = [...SWITCHABLE_COLUMN_KEYS];
+        this.setState({ visibleColumnKeys: keys });
+        this.saveVisibleColumnKeys(keys);
+    };
+
+    // 列设置面板内容：Checkbox 组 + 全选/重置快捷操作
+    // 说明：「操作」列不在面板里，它始终显示
+    renderColumnSettingPanel = () => (
+        <div style={{ minWidth: 200 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                <Button type="link" size="small" style={{ padding: 0 }} onClick={this.handleSelectAllColumns}>全选</Button>
+                <Button type="link" size="small" style={{ padding: 0 }} onClick={this.handleResetColumns}>重置</Button>
+            </div>
+            <Divider style={{ margin: '4px 0 8px' }} />
+            <Checkbox.Group
+                value={this.state.visibleColumnKeys}
+                onChange={this.handleVisibleColumnsChange}
+                style={{ display: 'flex', flexDirection: 'column', gap: 6 }}
+            >
+                {SWITCHABLE_COLUMN_KEYS.map(key => (
+                    <Checkbox key={key} value={key}>{COLUMN_KEY_LABELS[key] || key}</Checkbox>
+                ))}
+            </Checkbox.Group>
+            <div style={{ color: '#999', fontSize: 12, marginTop: 8, paddingTop: 6, borderTop: '1px dashed #f0f0f0' }}>
+                「操作」列始终显示
+            </div>
+        </div>
+    );
+
     // ---- 性能：列定义缓存 ----
     //
     // antd Table 对 columns 的「引用变化」极为敏感：引用一变就会重建列结构、重算固定列与筛选器，
@@ -1437,7 +1615,7 @@ class LiveList extends React.Component<Props, IState> {
     private cachedAddressFilterKey = '';
 
     // getCachedColumns 返回带排序状态的列定义，仅在真正影响列内容的条件变化时才重建。
-    // 影响列内容的条件：屏幕宽窄（决定用 columns 还是 smallColumns）、排序状态、平台筛选列表。
+    // 影响列内容的条件：屏幕宽窄（决定用 columns 还是 smallColumns）、排序状态、平台筛选列表、列显示设置。
     getCachedColumns = (): ColumnsType<ItemData> => {
         const isSmall = this.state.window.screen.width <= 768;
         const baseColumns = isSmall ? this.smallColumns : this.columns;
@@ -1446,14 +1624,18 @@ class LiveList extends React.Component<Props, IState> {
         const addressList = Array.from(new Set(this.state.list.map(item => item.address)));
         const addressKey = addressList.join('\u0001');
 
-        const { sortedInfo } = this.state;
-        const cacheKey = `${isSmall}|${sortedInfo.columnKey}|${sortedInfo.order}|${addressKey}`;
+        const { sortedInfo, visibleColumnKeys } = this.state;
+        // 列显示设置必须进入缓存键：否则用户切换列显隐后缓存不失效，界面不会更新
+        const visibleKey = visibleColumnKeys.join(',');
+        const cacheKey = `${isSmall}|${sortedInfo.columnKey}|${sortedInfo.order}|${addressKey}|${visibleKey}`;
         if (this.cachedColumns && this.cachedColumnsKey === cacheKey) {
             return this.cachedColumns;
         }
 
         // 平台列的筛选器取决于当前列表里实际出现了哪些平台，属动态项，
         // 仅在列表真的变化时更新一次，避免每次渲染都赋一个新数组让 Table 误判为"列变了"。
+        // 注意：这里遍历的是未过滤的 baseColumns，被隐藏的列同样会被更新，
+        // 这样用户重新勾选该列时筛选器选项依然是最新的。
         if (this.cachedAddressFilterKey !== addressKey) {
             this.cachedAddressFilterKey = addressKey;
             baseColumns.forEach((column: ColumnsType<ItemData>[number]) => {
@@ -1465,7 +1647,17 @@ class LiveList extends React.Component<Props, IState> {
             });
         }
 
-        this.cachedColumns = this.getColumnsWithSort(baseColumns);
+        // 按用户的列设置过滤列：「操作」列始终显示，其余列只有被勾选时才出现。
+        // 列元素本身仍是同一批对象引用，Table 不会因为过滤本身而重建列结构。
+        const visibleColumns = baseColumns.filter((column: ColumnsType<ItemData>[number]) => {
+            const key = String(column.key || '');
+            if (key === ALWAYS_VISIBLE_COLUMN_KEY) {
+                return true;
+            }
+            return visibleColumnKeys.includes(key);
+        });
+
+        this.cachedColumns = this.getColumnsWithSort(visibleColumns);
         this.cachedColumnsKey = cacheKey;
         return this.cachedColumns;
     };
@@ -2514,6 +2706,15 @@ class LiveList extends React.Component<Props, IState> {
                                         />
                                     </Space>
                                 </Tooltip>
+                                {/* 列设置入口：点击弹出 Checkbox 面板，可自由开关每一列（选择持久化到 localStorage） */}
+                                <Popover
+                                    trigger="click"
+                                    placement="bottomRight"
+                                    title="列设置"
+                                    content={this.renderColumnSettingPanel()}
+                                >
+                                    <Button icon={<SettingOutlined />}>列设置</Button>
+                                </Popover>
                                 <Button key="2" type="default" onClick={this.onSettingSave}>保存设置</Button>
                                 <Button key="1" type="primary" onClick={() => this.setState({ batchAddDialogVisible: true })}>
                                     添加房间
@@ -2561,26 +2762,47 @@ class LiveList extends React.Component<Props, IState> {
                         )}
                         <Table
                             className="item-pad"
+                            // 用于深度链接按 key 定位行（虚拟滚动下 DOM 里可能没有目标行）
+                            ref={this.tableRef}
                             columns={this.getCachedColumns()}
                             dataSource={this.state.list}
                             size={(this.state.window.screen.width > 768) ? "large" : "middle"}
-                            // 性能：原先 pagination={false} 会把全部直播间（线上实测 210 个）一次性渲染，
+                            // ---- 性能：改为 antd 虚拟滚动 ----
+                            // 原先 pagination={false} 会把全部直播间（线上实测 210 个）一次性渲染，
                             // 每行含 3 个 Tag + 下拉菜单 + 气泡确认 + 复选框 + 多个按钮，
                             // 合计三千多个 antd 组件实例；antd v6 的 CSS-in-JS 在实例数很大时，
                             // 每次协调都要重新计算样式哈希，导致主线程长期繁忙、hover 反馈延迟数百毫秒。
-                            // 这里改为分页（默认 50 条/页），并允许用户自行调整每页数量。
-                            pagination={{
-                                defaultPageSize: 50,
-                                pageSizeOptions: ['20', '50', '100', '200'],
-                                showSizeChanger: true,
-                                showQuickJumper: true,
-                                size: 'small',
-                                showTotal: (total, range) => `${range[0]}-${range[1]} / 共 ${total} 个直播间`,
-                            }}
+                            // 虚拟滚动只渲染「可视区域 + 缓冲」内的行，实例数从数千降到几十。
+                            //
+                            // 关键点：虚拟滚动只影响"渲染哪些行"，dataSource 依旧是完整列表（this.state.list），
+                            // 因此排序、列筛选、以及多选全选的语义都与完整 dataSource 一致，
+                            // 未渲染出来的行同样参与筛选和全选（详见下方 rowSelection 的注释）。
+                            //
+                            // 注意：antd 硬性要求 virtual 必须同时提供「数字类型」的 scroll.x 与 scroll.y，
+                            // 缺任意一个都会在控制台报错并使虚拟滚动失效。
+                            // 列宽未显式指定，由 rc-table 按 scroll.x 均分（8 列时约 275px/列），
+                            // 隐藏列后每列会自动变宽，因此这里给 2200 足够容纳全部列。
+                            virtual
+                            scroll={{ x: 2200, y: 600 }}
+                            // 虚拟滚动下不能再用分页（分页 + virtual 会互相干扰）
+                            pagination={false}
                             expandedRowKeys={this.state.expandedRowKeys}
+                            // 展开行与虚拟滚动是兼容的：@rc-component/table 的 VirtualTable/BodyLine
+                            // 会把 expandedRowRender 的结果一并放进虚拟列表渲染，因此展开功能保持原样。
+                            // 已知固有折中：虚拟滚动按固定行高估算总高度，而展开行远高于普通行，
+                            // 所以有行处于展开状态时滚动条位置可能略有跳动——这是 antd 虚拟表格的既有取舍，
+                            // 这里不做 hack 修复，避免引入更复杂的定位问题。
                             expandedRowRender={this.renderExpandedRow}
                             rowKey={record => record.roomId}
                             // 需求7：多选批量操作
+                            // 全选语义（与虚拟滚动无关）：
+                            // 1) selectedRowKeys 是我们自己维护的「全量 key 列表」，不读取任何 DOM / 已渲染行，
+                            //    虚拟滚动不改变 dataSource，所以未渲染出来的行也会被选中；
+                            // 2) 表头全选时，antd 依据「完整 dataSource（有列筛选时则是完整筛选结果）」
+                            //    算出 key 列表后通过 onChange 回传，我们直接采用该结果，不做任何基于可见行的裁剪；
+                            // 3) 因此"筛选后全选 = 选中筛选结果"，保持 antd 的既有语义。
+                            // 说明：antd v6 中 rowSelection.onSelectAll 已标记 deprecated（v7 将移除），
+                            // 为避免依赖即将移除的 API，这里统一走 onChange，不再额外挂 onSelectAll。
                             rowSelection={{
                                 selectedRowKeys: this.state.selectedRowKeys,
                                 onChange: this.setSelectedRowKeys,
@@ -2602,7 +2824,12 @@ class LiveList extends React.Component<Props, IState> {
                                     if (target.closest && target.closest('.ant-table-selection-column, .ant-table-selection-col, .ant-checkbox-wrapper')) {
                                         return;
                                     }
-                                    if (target.tagName === 'TD') {
+                                    // 虚拟滚动下表体改用 div 网格渲染（不再是 <td>），
+                                    // 因此这里同时兼容普通表格的 TD 与虚拟表格的 .ant-table-cell，
+                                    // 保证"点击行的空白处展开"这一交互在虚拟滚动下依然可用。
+                                    const isCell = target.tagName === 'TD'
+                                        || (target.tagName === 'DIV' && target.classList.contains('ant-table-cell'));
+                                    if (isCell) {
                                         this.toggleExpandRow(record.roomId);
                                     }
                                 }

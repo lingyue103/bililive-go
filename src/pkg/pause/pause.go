@@ -18,6 +18,7 @@ package pause
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -177,8 +178,32 @@ type cancelRoundTripper struct {
 
 func (t *cancelRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	ctx, cancel := Default().BindRequest(req.Context())
-	defer cancel()
-	return t.base.RoundTrip(req.WithContext(ctx))
+	resp, err := t.base.RoundTrip(req.WithContext(ctx))
+	if err != nil {
+		// 请求本身失败，立即释放
+		cancel()
+		return nil, err
+	}
+	// 关键：**不能**在 RoundTrip 返回时就 cancel。
+	// 调用方（http.Client 的使用者）是在 RoundTrip 返回**之后**才读取 resp.Body 的，
+	// 此时若 ctx 已被取消，传输层会关闭连接，导致响应体读取失败 ——
+	// 小体积 JSON 因为已进入缓冲区才侥幸正常，慢响应/大响应则会中断。
+	// 因此把 cancel 推迟到 Body.Close()。
+	resp.Body = &cancelOnCloseBody{ReadCloser: resp.Body, cancel: cancel}
+	return resp, nil
+}
+
+// cancelOnCloseBody 在响应体关闭时释放闸门绑定的 context。
+type cancelOnCloseBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *cancelOnCloseBody) Close() error {
+	err := b.ReadCloser.Close()
+	// context.CancelFunc 幂等，重复调用安全
+	b.cancel()
+	return err
 }
 
 // WrapTransport 用闸门包装一个 http.RoundTripper，
