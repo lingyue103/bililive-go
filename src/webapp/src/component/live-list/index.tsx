@@ -376,6 +376,15 @@ class LiveList extends React.Component<Props, IState> {
         title: '运行状态',
         key: 'tags',
         dataIndex: 'tags',
+        // 性能：筛选器与过滤函数都是静态的，直接定义在列上即可。
+        // 原先在 render() 里每次渲染都用 .map() 生成新数组、新函数赋给 column.filters/onFilter，
+        // 会让 antd Table 每次渲染都认为列定义变了并重建内部结构。
+        filters: [
+            '初始化', '监控中', '录制中', '录制准备中', '仅提醒', '已停止',
+            // 需求1/6：一次性录制与录制时间段带来的新状态
+            '一次性录制中', '待删除', '等待首次直播', '时段外仅监控',
+        ].map(text => ({ text, value: text })),
+        onFilter: (value: string | number | boolean, record: ItemData) => record.tags.includes(value as string),
         render: (tags: string[]) => (
             <span>
                 {tags.map(tag => {
@@ -899,14 +908,35 @@ class LiveList extends React.Component<Props, IState> {
     }
 
     // 设置列表级别的SSE订阅
+    // ---- 性能：SSE 触发的列表刷新防抖 ----
+    //
+    // 后端对每个直播间分别广播 live_update / list_change。批量操作、程序启动、
+    // 或短时间内多个房间状态变化时，前端可能瞬间收到几十上百条事件；
+    // 原先每条都立即 requestListData()（拉取 210 条、约 65KB 响应）并 setState，
+    // 会连续触发全表重渲染，直接表现为主线程长时间繁忙、界面点击/悬停无响应。
+    // 这里把窗口内的多次刷新合并为一次。
+    private listRefreshTimer: NodeJS.Timeout | null = null;
+
+    // scheduleListRefresh 延迟合并列表刷新请求。
+    // delay 默认 400ms：既能合并突发事件，又不会让状态变化看起来明显延迟。
+    scheduleListRefresh = (delay = 400) => {
+        if (this.listRefreshTimer) {
+            clearTimeout(this.listRefreshTimer);
+        }
+        this.listRefreshTimer = setTimeout(() => {
+            this.listRefreshTimer = null;
+            this.requestListData();
+        }, delay);
+    };
+
     setupListSSE = () => {
         // 如果已经有订阅，先清理
         this.cleanupListSSE();
 
         // 订阅所有房间的 live_update 事件（直播状态变化）
         const liveUpdateSubId = subscribeSSE('*', 'live_update', (message: SSEMessage) => {
-            // 刷新列表数据
-            this.requestListData();
+            // 性能：改用合并刷新，避免突发多条事件时连续重渲染整个列表
+            this.scheduleListRefresh();
             // 如果该房间已展开，也刷新详情
             if (this.state.expandedRowKeys.includes(message.room_id)) {
                 this.loadRoomDetail(message.room_id);
@@ -919,8 +949,8 @@ class LiveList extends React.Component<Props, IState> {
             const roomId = message.room_id;
             const changeType = message.data?.change_type;
 
-            // 刷新列表数据
-            this.requestListData();
+            // 性能：同上，合并刷新
+            this.scheduleListRefresh();
 
             // 如果该房间已展开，且是监控开关变化，重新加载详情（更新调度器状态）
             if (roomId && this.state.expandedRowKeys.includes(roomId)) {
@@ -1096,6 +1126,11 @@ class LiveList extends React.Component<Props, IState> {
         //clear refresh timer
         clearInterval(this.timer);
         clearInterval(this.countdownTimer);
+        // 性能：清理列表合并刷新的定时器，避免组件卸载后仍触发 setState
+        if (this.listRefreshTimer) {
+            clearTimeout(this.listRefreshTimer);
+            this.listRefreshTimer = null;
+        }
         // 清理弹幕批量缓冲
         if (this.danmakuFlushTimer) {
             clearTimeout(this.danmakuFlushTimer);
@@ -1390,6 +1425,51 @@ class LiveList extends React.Component<Props, IState> {
         });
     };
 
+    // ---- 性能：列定义缓存 ----
+    //
+    // antd Table 对 columns 的「引用变化」极为敏感：引用一变就会重建列结构、重算固定列与筛选器，
+    // 对 210 行的表格来说这是每次渲染的固定开销。
+    // 原先每次 render 都调用 getColumnsWithSort(...) 生成新数组，并在 render() 里就地改写
+    // this.columns 的 filters/onFilter（同样每次生成新数组），二者叠加使 Table 每次渲染都全量重建。
+    // 这里按「影响列内容的键」把结果缓存起来。
+    private cachedColumns: ColumnsType<ItemData> | null = null;
+    private cachedColumnsKey = '';
+    private cachedAddressFilterKey = '';
+
+    // getCachedColumns 返回带排序状态的列定义，仅在真正影响列内容的条件变化时才重建。
+    // 影响列内容的条件：屏幕宽窄（决定用 columns 还是 smallColumns）、排序状态、平台筛选列表。
+    getCachedColumns = (): ColumnsType<ItemData> => {
+        const isSmall = this.state.window.screen.width <= 768;
+        const baseColumns = isSmall ? this.smallColumns : this.columns;
+
+        // 平台筛选列表（去重后作为筛选器选项）；只有它变化时才需要重建列
+        const addressList = Array.from(new Set(this.state.list.map(item => item.address)));
+        const addressKey = addressList.join('\u0001');
+
+        const { sortedInfo } = this.state;
+        const cacheKey = `${isSmall}|${sortedInfo.columnKey}|${sortedInfo.order}|${addressKey}`;
+        if (this.cachedColumns && this.cachedColumnsKey === cacheKey) {
+            return this.cachedColumns;
+        }
+
+        // 平台列的筛选器取决于当前列表里实际出现了哪些平台，属动态项，
+        // 仅在列表真的变化时更新一次，避免每次渲染都赋一个新数组让 Table 误判为"列变了"。
+        if (this.cachedAddressFilterKey !== addressKey) {
+            this.cachedAddressFilterKey = addressKey;
+            baseColumns.forEach((column: ColumnsType<ItemData>[number]) => {
+                if (column.key === 'address') {
+                    column.filters = addressList.map(text => ({ text, value: text }));
+                    column.onFilter = (value: string | number | boolean, record: ItemData) =>
+                        record.address === value;
+                }
+            });
+        }
+
+        this.cachedColumns = this.getColumnsWithSort(baseColumns);
+        this.cachedColumnsKey = cacheKey;
+        return this.cachedColumns;
+    };
+
     toggleExpandRow = (roomId: string) => {
         const isCurrentlyExpanded = this.state.expandedRowKeys.includes(roomId);
 
@@ -1473,8 +1553,8 @@ class LiveList extends React.Component<Props, IState> {
             case 'live_update':
                 // 刷新房间详情
                 this.loadRoomDetail(roomId);
-                // 同时刷新列表数据
-                this.requestListData();
+                // 性能：合并刷新列表，避免突发多条事件时连续重渲染整个表格
+                this.scheduleListRefresh();
                 break;
 
             case 'conn_stats':
@@ -2398,20 +2478,8 @@ class LiveList extends React.Component<Props, IState> {
     }
 
     render() {
-        const { list } = this.state;
-        this.columns.forEach((column: ColumnsType<ItemData>[number]) => {
-            if (column.key === 'address') {
-                // 直播平台去重数组
-                const addressList = Array.from(new Set(list.map(item => item.address)));
-                column.filters = addressList.map(text => ({ text, value: text }));
-                column.onFilter = (value: string | number | boolean, record: ItemData) => record.address === value;
-            }
-            if (column.key === 'tags') {
-                // 需求1/6：筛选白名单同步加入一次性录制与录制时间段相关的新状态
-                column.filters = ['初始化', '监控中', '录制中', '录制准备中', '仅提醒', '已停止', '一次性录制中', '待删除', '等待首次直播', '时段外仅监控'].map(text => ({ text, value: text }));
-                column.onFilter = (value: string | number | boolean, record: ItemData) => record.tags.includes(value as string);
-            }
-        })
+        // 性能：列定义与筛选器已移入 getCachedColumns() 缓存，
+        // 这里不再每次渲染都就地改写 this.columns（那会产生新数组并让 Table 重建列结构）。
         return (
             <div>
                 <Tabs defaultActiveKey="livelist" type="card" onChange={this.requestData}>
@@ -2493,10 +2561,22 @@ class LiveList extends React.Component<Props, IState> {
                         )}
                         <Table
                             className="item-pad"
-                            columns={this.getColumnsWithSort((this.state.window.screen.width > 768) ? this.columns : this.smallColumns)}
+                            columns={this.getCachedColumns()}
                             dataSource={this.state.list}
                             size={(this.state.window.screen.width > 768) ? "large" : "middle"}
-                            pagination={false}
+                            // 性能：原先 pagination={false} 会把全部直播间（线上实测 210 个）一次性渲染，
+                            // 每行含 3 个 Tag + 下拉菜单 + 气泡确认 + 复选框 + 多个按钮，
+                            // 合计三千多个 antd 组件实例；antd v6 的 CSS-in-JS 在实例数很大时，
+                            // 每次协调都要重新计算样式哈希，导致主线程长期繁忙、hover 反馈延迟数百毫秒。
+                            // 这里改为分页（默认 50 条/页），并允许用户自行调整每页数量。
+                            pagination={{
+                                defaultPageSize: 50,
+                                pageSizeOptions: ['20', '50', '100', '200'],
+                                showSizeChanger: true,
+                                showQuickJumper: true,
+                                size: 'small',
+                                showTotal: (total, range) => `${range[0]}-${range[1]} / 共 ${total} 个直播间`,
+                            }}
                             expandedRowKeys={this.state.expandedRowKeys}
                             expandedRowRender={this.renderExpandedRow}
                             rowKey={record => record.roomId}
@@ -2510,7 +2590,9 @@ class LiveList extends React.Component<Props, IState> {
                             onExpand={(expanded, record) => this.toggleExpandRow(record.roomId)}
                             onRow={(record) => ({
                                 id: `row-live-${record.roomId}`,
-                                style: { transition: 'background-color 1s' },
+                                // 性能：原为 transition 1s，视觉上表现为"点了没反应"，
+                                // 实测会让人误以为界面卡死；缩短到 0.15s 保留反馈又跟手。
+                                style: { transition: 'background-color 0.15s' },
                                 onClick: (e) => {
                                     // 只有点击 td 单元格本身（空白处）才触发展开
                                     // 如果点击的是 td 内的内容元素，则不触发
