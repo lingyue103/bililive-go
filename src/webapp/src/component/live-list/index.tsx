@@ -325,6 +325,44 @@ const COLUMN_KEY_LABELS: { [key: string]: string } = {
 // 列显示设置的 localStorage key
 const VISIBLE_COLUMNS_STORAGE_KEY = 'liveListVisibleColumns';
 
+// ==================== 表格列宽与虚拟滚动宽度（两处必须保持一致） ====================
+
+// 「展开图标列（+）」与「复选框列」的宽度。
+// 这两列在传给 rc-table 的列定义里没有 width（antd 只给它们挂了 CSS 类宽度，
+// 而虚拟滚动下 rc-table 会把 useWidthColumns 均分/填充出来的宽度写成 <col> 上的
+// 行内 style，优先级高于 CSS 类），因此不显式指定就会被按 scroll.x 均分、各占 200px 以上。
+// 这里统一取 48px（与 antd 自身默认的展开列宽一致）：
+//   - 复选框列：antd 给该列的内边距是 8px ×2，加 16px 复选框，48px 绰绰有余；
+//   - 展开列：图标布局盒固定 17px（controlInteractiveSize 16 推导而来），
+//     桌面端 size="large" 时该列内边距 16px ×2，内容区 16px，图标不会溢出。
+const EXTRA_COLUMN_WIDTH = 48;
+
+// 桌面端 scroll.x 合计：展开列 44 + 复选框列 44 + 各业务列 width 之和。
+// ⚠️ 必须与 columns 数组里各列的 width 严格一致（含 addedAtColumn / lastLiveColumn /
+//    folderSizeColumn / runStatus / runAction 这几个独立列定义）：
+//    一旦「各列 width 之和 < scroll.x」，rc-table 的 useWidthColumns 会把多出来的宽度
+//    按比例放大给所有列，列宽又会失控（这正是本轮要修的问题）。
+const TABLE_SCROLL_X = EXTRA_COLUMN_WIDTH + EXTRA_COLUMN_WIDTH
+    + 140 // 主播名称
+    + 140 // 直播间名称
+    + 90 // 直播平台（内容很短，刻意收窄）
+    + 165 // 添加链接时间（比建议的 150 宽：19 字符的时间串在大号表格下会换行）
+    + 165 // 最近一次直播时间（同上）
+    + 130 // 文件夹大小（表头「文件夹大小」+ 刷新图标约需 90px，100px 会让表头折行，故给 130）
+    + 220 // 运行状态（可能同时显示多个 Tag）
+    + 240; // 操作（平铺「停止监控/文件/配置」+「更多」下拉，待删除行还有两个挽留按钮）
+
+// 移动端（≤768px）用的是 smallColumns：没有「直播间名称」「直播平台」两列，列数更少、合计更小。
+// 若移动端沿用桌面端的 TABLE_SCROLL_X，多出来的宽度同样会被按比例摊给各列，
+// 移动端反而要横向滚动更远，所以单独给出移动端的合计值。
+const SMALL_TABLE_SCROLL_X = EXTRA_COLUMN_WIDTH + EXTRA_COLUMN_WIDTH
+    + 140 // 主播名称
+    + 165 // 添加链接时间（与 addedAtColumn 共用列定义，宽度必须一致）
+    + 165 // 最近一次直播时间（与 lastLiveColumn 共用列定义，宽度必须一致）
+    + 130 // 文件夹大小（与 folderSizeColumn 共用列定义，宽度必须一致）
+    + 220 // 运行状态
+    + 240; // 操作
+
 // 生成「模糊搜索」筛选面板（主播名称 / 直播间名称两列共用，避免重复代码）。
 // 用自定义 filterDropdown 而不是 filters + filterSearch，因为这里要的是输入即匹配的模糊搜索；
 // 搜索状态由 antd 自己维护（selectedKeys -> onFilter），不需要手动传 filteredValue。
@@ -465,6 +503,9 @@ class LiveList extends React.Component<Props, IState> {
         title: '运行状态',
         key: 'tags',
         dataIndex: 'tags',
+        // 列宽：该列可能同时显示多个 Tag（如「录制中」+「一次性录制中」），固定 220px
+        // （需与 TABLE_SCROLL_X / SMALL_TABLE_SCROLL_X 中的 220 保持一致）
+        width: 220,
         // 性能：筛选器与过滤函数都是静态的，直接定义在列上即可。
         // 原先在 render() 里每次渲染都用 .map() 生成新数组、新函数赋给 column.filters/onFilter，
         // 会让 antd Table 每次渲染都认为列定义变了并重建内部结构。
@@ -538,6 +579,10 @@ class LiveList extends React.Component<Props, IState> {
         title: '操作',
         key: 'action',
         dataIndex: 'listening',
+        // 列宽：方案B 平铺「停止监控 / 文件 / 配置」+「更多 ▾」下拉，
+        // 「待删除」行还会多出「重置为一次性 / 转为永久」两个按钮，因此给到 240px
+        // （需与 TABLE_SCROLL_X / SMALL_TABLE_SCROLL_X 中的 240 保持一致）
+        width: 240,
         render: (listening: boolean, data: ItemData) => {
             // 方案B：低频操作收进「更多」下拉菜单，避免操作列过于拥挤
             const moreItems: any[] = [
@@ -736,6 +781,11 @@ class LiveList extends React.Component<Props, IState> {
         title: '添加链接时间',
         dataIndex: 'addedAt',
         key: 'addedAt',
+        // 列宽：165px。本列固定渲染 "YYYY-MM-DD HH:mm:ss"（19 字符，桌面端 14px 字号约 124~128px），
+        // 而 antd 大号表格（size="large"）单元格左右内边距各 16px，150px 列只剩 118px 会换行；
+        // 虚拟滚动按固定行高定位行，换行会让该行覆盖下一行，因此留出余量给到 165px
+        // （需与 TABLE_SCROLL_X / SMALL_TABLE_SCROLL_X 中的 165 保持一致）
+        width: 165,
         sorter: (a: ItemData, b: ItemData) => a.addedAt - b.addedAt,
         render: (addedAt: number) => (
             <span>{addedAt ? Utils.timestampToHumanReadable(addedAt) : '-'}</span>
@@ -747,6 +797,11 @@ class LiveList extends React.Component<Props, IState> {
         title: '最近一次直播时间',
         dataIndex: 'lastStartTimeUnix',
         key: 'lastStartTimeUnix',
+        // 列宽：165px。本列固定渲染 "YYYY-MM-DD HH:mm:ss"（19 字符，桌面端 14px 字号约 124~128px），
+        // 而 antd 大号表格（size="large"）单元格左右内边距各 16px，150px 列只剩 118px 会换行；
+        // 虚拟滚动按固定行高定位行，换行会让该行覆盖下一行，因此留出余量给到 165px
+        // （需与 TABLE_SCROLL_X / SMALL_TABLE_SCROLL_X 中的 165 保持一致）
+        width: 165,
         sorter: (a: ItemData, b: ItemData) => a.lastStartTimeUnix - b.lastStartTimeUnix,
         render: (lastStartTimeUnix: number) => (
             <span>{lastStartTimeUnix ? Utils.timestampToHumanReadable(lastStartTimeUnix) : '从未直播'}</span>
@@ -773,6 +828,9 @@ class LiveList extends React.Component<Props, IState> {
         )) as any,
         dataIndex: 'folderSizeHuman',
         key: 'folderSize',
+        // 列宽：130px —— 表头「文件夹大小」+ 手动刷新图标约需 90px 宽，
+        // 给 100px 会让表头折成两行（需与 TABLE_SCROLL_X / SMALL_TABLE_SCROLL_X 中的 130 保持一致）
+        width: 130,
         sorter: (a: ItemData, b: ItemData) => a.folderSize - b.folderSize,
         render: (folderSizeHuman: string) => (
             <span>{folderSizeHuman || '-'}</span>
@@ -784,6 +842,11 @@ class LiveList extends React.Component<Props, IState> {
             title: '主播名称',
             dataIndex: 'name',
             key: 'name',
+            // 列宽：140px（需与 TABLE_SCROLL_X 中的 140 保持一致）
+            width: 140,
+            // 长主播名必须单行省略：虚拟滚动按**固定行高**绝对定位每一行，
+            // 单元格一旦换行会让该行变高，从而压住下一行、错位整屏。
+            ellipsis: true,
             sorter: (a: ItemData, b: ItemData) => {
                 return a.name.localeCompare(b.name);
             },
@@ -798,6 +861,10 @@ class LiveList extends React.Component<Props, IState> {
             title: '直播间名称',
             dataIndex: 'room',
             key: 'room',
+            // 列宽：140px（需与 TABLE_SCROLL_X 中的 140 保持一致；移动端不显示本列）
+            width: 140,
+            // 同上：长直播间名单行省略，避免换行破坏虚拟滚动的固定行高
+            ellipsis: true,
             // 需求：直播间名称列同样提供模糊搜索（匹配的是 record.room.roomName，不是整个 room 对象）
             // 该列原本没有 sorter，这里只增加筛选入口，不影响其他列排序
             filterDropdown: createFuzzyFilterDropdown('搜索直播间名称'),
@@ -821,6 +888,8 @@ class LiveList extends React.Component<Props, IState> {
             title: '直播平台',
             dataIndex: 'address',
             key: 'address',
+            // 列宽：90px（平台名很短，用户要求刻意收窄；需与 TABLE_SCROLL_X 中的 90 保持一致）
+            width: 90,
             sorter: (a: ItemData, b: ItemData) => {
                 return a.address.localeCompare(b.address);
             },
@@ -839,6 +908,10 @@ class LiveList extends React.Component<Props, IState> {
             title: '主播名称',
             dataIndex: 'name',
             key: 'name',
+            // 列宽：140px（需与 SMALL_TABLE_SCROLL_X 中的 140 保持一致）
+            width: 140,
+            // 同上：长主播名单行省略，避免换行破坏虚拟滚动的固定行高
+            ellipsis: true,
             // 需求：移动端（小屏）的主播名称列同样提供模糊搜索，与桌面端保持一致
             filterDropdown: createFuzzyFilterDropdown('搜索主播名称'),
             onFilter: (value: any, record: ItemData) =>
@@ -2780,10 +2853,18 @@ class LiveList extends React.Component<Props, IState> {
                             //
                             // 注意：antd 硬性要求 virtual 必须同时提供「数字类型」的 scroll.x 与 scroll.y，
                             // 缺任意一个都会在控制台报错并使虚拟滚动失效。
-                            // 列宽未显式指定，由 rc-table 按 scroll.x 均分（8 列时约 275px/列），
-                            // 隐藏列后每列会自动变宽，因此这里给 2200 足够容纳全部列。
+                            // scroll.x 必须等于「展开列 44 + 复选框列 44 + 当前列集合各列 width 之和」：
+                            // 各列 width 已显式指定，若合计小于 scroll.x，rc-table 会把多出来的宽度
+                            // 按比例摊给所有列，列宽又会失控（详见 TABLE_SCROLL_X / SMALL_TABLE_SCROLL_X 的注释）。
+                            // 桌面端用 columns（1348），移动端 ≤768px 用 smallColumns（1118），
+                            // 与 getCachedColumns() 里选择列集合的判断（width <= 768）保持一致。
+                            // 另外：用户用「列设置」隐藏列后合计会变小，rc-table 会把剩余列按比例
+                            // 放大（各列比例保持不变，不会再像原先那样被均分成一样宽）。
                             virtual
-                            scroll={{ x: 2200, y: 600 }}
+                            scroll={{
+                                x: this.state.window.screen.width > 768 ? TABLE_SCROLL_X : SMALL_TABLE_SCROLL_X,
+                                y: 600,
+                            }}
                             // 虚拟滚动下不能再用分页（分页 + virtual 会互相干扰）
                             pagination={false}
                             expandedRowKeys={this.state.expandedRowKeys}
@@ -2793,6 +2874,12 @@ class LiveList extends React.Component<Props, IState> {
                             // 所以有行处于展开状态时滚动条位置可能略有跳动——这是 antd 虚拟表格的既有取舍，
                             // 这里不做 hack 修复，避免引入更复杂的定位问题。
                             expandedRowRender={this.renderExpandedRow}
+                            // 展开图标列（+）：与复选框列同样默认没有固定宽度，会被虚拟滚动按
+                            // scroll.x 均分，这里显式收窄为 44px。
+                            // antd 允许 expandable 与下面这些顶层属性（expandedRowKeys /
+                            // expandedRowRender / onExpand）共存：rc-table 合并时会以上层
+                            // expandable 为准、再叠加顶层遗留属性，因此本行只补宽度，不影响展开逻辑。
+                            expandable={{ columnWidth: EXTRA_COLUMN_WIDTH }}
                             rowKey={record => record.roomId}
                             // 需求7：多选批量操作
                             // 全选语义（与虚拟滚动无关）：
@@ -2804,6 +2891,9 @@ class LiveList extends React.Component<Props, IState> {
                             // 说明：antd v6 中 rowSelection.onSelectAll 已标记 deprecated（v7 将移除），
                             // 为避免依赖即将移除的 API，这里统一走 onChange，不再额外挂 onSelectAll。
                             rowSelection={{
+                                // 复选框列：antd 默认不给该列固定宽度，会被虚拟滚动按 scroll.x 均分，
+                                // 因此显式收窄为 44px（其余原有配置保持不变）
+                                columnWidth: EXTRA_COLUMN_WIDTH,
                                 selectedRowKeys: this.state.selectedRowKeys,
                                 onChange: this.setSelectedRowKeys,
                                 // 给复选框带上所属直播间 id，便于识别
