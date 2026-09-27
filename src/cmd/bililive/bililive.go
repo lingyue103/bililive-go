@@ -35,6 +35,7 @@ import (
 	"github.com/bililive-go/bililive-go/src/pkg/metadata"
 	"github.com/bililive-go/bililive-go/src/pkg/openlist"
 	bilisentryPkg "github.com/bililive-go/bililive-go/src/pkg/sentry"
+	"github.com/bililive-go/bililive-go/src/pkg/softrestart"
 	"github.com/bililive-go/bililive-go/src/pkg/telemetry"
 	"github.com/bililive-go/bililive-go/src/pkg/update"
 	"github.com/bililive-go/bililive-go/src/recorders"
@@ -529,6 +530,13 @@ func main() {
 	if err := oneTimeManager.Start(ctx); err != nil {
 		logger.WithError(err).Warn("启动一次性录制状态机失败")
 	}
+
+	// 需求8：定时软重启。
+	// 软重启 = 切断所有直播连接（停录制器 + 停止向平台发请求），等待可配置时长后恢复。
+	// 这里只做调度与"关门/开门"，实际的请求闸门检查点在 live 层的请求调度器中。
+	softRestartManager := softrestart.NewManager(ctx, nil)
+	inst.SoftRestartManager = softRestartManager
+	softRestartManager.Start()
 
 	// 尽早启动 HTTP 服务器，让用户可以快速访问 Web 界面
 	// 即使 live rooms 还在初始化，用户也能看到页面

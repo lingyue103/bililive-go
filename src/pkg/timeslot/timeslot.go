@@ -180,6 +180,13 @@ func DescribeDays(days []int) string {
 	return strings.Join(out, ",")
 }
 
+// DayMatches 判断给定星期是否命中 days；days 为空表示每天。
+// 导出供其它包（例如定时软重启的计划计算）复用同一套星期语义，
+// 避免两处判定标准不一致。
+func DayMatches(days []int, weekday int) bool {
+	return dayMatches(days, weekday)
+}
+
 // dayMatches 判断星期是否匹配；days 为空表示每天。
 func dayMatches(days []int, weekday int) bool {
 	if len(days) == 0 {

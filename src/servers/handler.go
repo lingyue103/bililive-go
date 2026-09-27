@@ -1961,6 +1961,24 @@ func applyConfigUpdates(c *configs.Config, updates map[string]interface{}) error
 		c.RecordScheduleTemplates = parsed
 	}
 
+	// 【需求8】定时软重启配置
+	if ar, ok := updates["auto_restart"].(map[string]interface{}); ok {
+		if v, ok := ar["enable"].(bool); ok {
+			c.AutoRestart.Enable = v
+		}
+		if v, ok := ar["recovery_minutes"].(float64); ok {
+			c.AutoRestart.RecoveryMinutes = int(v)
+		}
+		// 计划列表为整段替换语义
+		if v, exists := ar["schedules"]; exists {
+			parsed, err := decodeJSONField[[]configs.AutoRestartSchedule](v)
+			if err != nil {
+				return fmt.Errorf("软重启计划格式错误: %w", err)
+			}
+			c.AutoRestart.Schedules = parsed
+		}
+	}
+
 	if appDataPath, ok := updates["app_data_path"].(string); ok {
 		c.AppDataPath = appDataPath
 	}

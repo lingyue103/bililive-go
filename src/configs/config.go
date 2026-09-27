@@ -624,6 +624,29 @@ type RecordScheduleTemplate struct {
 	Slots []timeslot.TimeSlot `yaml:"slots" json:"slots"`
 }
 
+// ---------- 需求8：定时软重启 ----------
+
+// AutoRestartSchedule 一条软重启计划。
+type AutoRestartSchedule struct {
+	// Days 生效的星期，0=周日、1=周一 ... 6=周六；空数组表示每天
+	Days []int `yaml:"days" json:"days"`
+	// Time 执行时间，"HH:MM" 格式
+	Time string `yaml:"time" json:"time"`
+}
+
+// AutoRestartConfig 定时软重启配置（本轮仅实现软重启，硬重启在容器内不可用）。
+//
+// 软重启语义：切断所有直播连接（停止录制器 + 不再向平台发起任何请求），
+// 等待 RecoveryMinutes 分钟后自动恢复请求。
+type AutoRestartConfig struct {
+	// Enable 是否启用定时软重启
+	Enable bool `yaml:"enable" json:"enable"`
+	// Schedules 软重启计划列表，可配置多个时间点（例如每天凌晨 3 点 + 每周一中午）
+	Schedules []AutoRestartSchedule `yaml:"schedules,omitempty" json:"schedules,omitempty"`
+	// RecoveryMinutes 切断流量后多少分钟恢复（默认 10）
+	RecoveryMinutes int `yaml:"recovery_minutes" json:"recovery_minutes"`
+}
+
 // Config content all config info.
 type Config struct {
 	// 核心配置
@@ -653,6 +676,9 @@ type Config struct {
 
 	// 录制时间段模板（需求6，全局共享）
 	RecordScheduleTemplates []RecordScheduleTemplate `yaml:"record_schedule_templates,omitempty" json:"record_schedule_templates,omitempty"`
+
+	// 定时软重启配置（需求8）
+	AutoRestart AutoRestartConfig `yaml:"auto_restart" json:"auto_restart"`
 
 	// 流偏好配置 - 两套系统并存
 	StreamPreference StreamPreference `yaml:"stream_preference,omitempty" json:"stream_preference,omitempty"` // 新版（渐进迁移中）
@@ -1245,6 +1271,12 @@ var defaultConfig = Config{
 		WaitMinutes:    10,
 		VerifySegments: true, // 默认开启坏片段校验，避免坏片段污染整个合并结果
 	},
+	// 需求8：定时软重启默认配置（默认关闭；示例计划留空，由用户在设置页添加）
+	AutoRestart: AutoRestartConfig{
+		Enable:          false,
+		Schedules:       []AutoRestartSchedule{},
+		RecoveryMinutes: 10,
+	},
 	Notify: Notify{
 		SendRecordingSummary: false,
 		Telegram: Telegram{
@@ -1507,6 +1539,32 @@ func (c *Config) Verify() error {
 		return err
 	}
 
+	// 【需求8】定时软重启校验
+	if err := c.validateAutoRestart(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// validateAutoRestart 校验定时软重启配置（需求8）：
+// 恢复时长必须为正；每条计划的时间必须是合法 "HH:MM"；星期取值必须在 0..6。
+func (c *Config) validateAutoRestart() error {
+	ar := c.AutoRestart
+	if ar.RecoveryMinutes <= 0 {
+		return fmt.Errorf("软重启的「恢复时长」必须大于 0 分钟")
+	}
+	for i := range ar.Schedules {
+		sc := &ar.Schedules[i]
+		if _, err := timeslot.ParseHHMM(sc.Time); err != nil {
+			return fmt.Errorf("第 %d 条软重启计划的时间无效: %v", i+1, err)
+		}
+		for _, d := range sc.Days {
+			if d < 0 || d > 6 {
+				return fmt.Errorf("第 %d 条软重启计划的星期取值 %d 无效（应为 0-6，0=周日）", i+1, d)
+			}
+		}
+	}
 	return nil
 }
 
@@ -1770,6 +1828,18 @@ func CloneConfigShallow(src *Config) *Config {
 			cp.RecordScheduleTemplates[i] = RecordScheduleTemplate{
 				Name:  src.RecordScheduleTemplates[i].Name,
 				Slots: cloneRecordTimeSlots(src.RecordScheduleTemplates[i].Slots),
+			}
+		}
+	}
+	// 【需求8】软重启计划：外层切片与内层 Days 都必须深拷贝
+	if src.AutoRestart.Schedules != nil {
+		cp.AutoRestart.Schedules = make([]AutoRestartSchedule, len(src.AutoRestart.Schedules))
+		for i := range src.AutoRestart.Schedules {
+			sc := src.AutoRestart.Schedules[i]
+			cp.AutoRestart.Schedules[i] = AutoRestartSchedule{Time: sc.Time}
+			if sc.Days != nil {
+				cp.AutoRestart.Schedules[i].Days = make([]int, len(sc.Days))
+				copy(cp.AutoRestart.Schedules[i].Days, sc.Days)
 			}
 		}
 	}

@@ -148,6 +148,23 @@ func DecorateConfigNode(node *yaml.Node) {
 # days: 0=周日,1=周一,...,6=周六；留空表示每天
 # start/end: "HH:MM" 格式，必须 start < end（不支持跨天，如需覆盖凌晨请拆成两条）`
 	}
+
+	// 需求8：定时软重启的配置注释
+	if arNode := findNode(root, "auto_restart"); arNode != nil {
+		setFieldComment(arNode, "enable",
+			`# 是否启用定时软重启`, "")
+		arNode.HeadComment = `# 定时软重启（本轮仅实现软重启）
+# 软重启：切断所有直播连接（停止录制器 + 不再向平台发起任何请求），
+#         等待 recovery_minutes 分钟后自动恢复请求。
+# 硬重启（重启整个进程）在容器内不可用，未实现。`
+		if scNode := findNode(arNode, "schedules"); scNode != nil {
+			scNode.HeadComment = `# 软重启计划列表，可配置多个时间点
+# days: 0=周日,1=周一,...,6=周六；留空表示每天
+# time: "HH:MM" 格式的执行时刻`
+		}
+		setFieldComment(arNode, "recovery_minutes",
+			`# 切断流量后多少分钟恢复（默认 10）`, "")
+	}
 }
 
 func findNode(mapNode *yaml.Node, key string) *yaml.Node {

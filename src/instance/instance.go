@@ -25,4 +25,7 @@ type Instance struct {
 	// FolderSizeManager 录制文件夹大小统计管理器（*foldersize.Manager，需求3）。
 	// 用 interface{} 承载以避免 instance 包反向依赖具体实现包，与 LiveStateManager 的做法一致。
 	FolderSizeManager interface{}
+
+	// SoftRestartManager 定时软重启管理器（*softrestart.Manager，需求8）。
+	SoftRestartManager interface{}
 }

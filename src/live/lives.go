@@ -14,6 +14,7 @@ import (
 
 	"github.com/bililive-go/bililive-go/src/configs"
 	"github.com/bililive-go/bililive-go/src/pkg/livelogger"
+	"github.com/bililive-go/bililive-go/src/pkg/pause"
 	"github.com/bililive-go/bililive-go/src/pkg/ratelimit"
 	bilisentry "github.com/bililive-go/bililive-go/src/pkg/sentry"
 	"github.com/bililive-go/bililive-go/src/types"
@@ -239,6 +240,9 @@ const (
 	// toolReadinessPollInterval 依赖工具未就绪时重新检查的间隔。
 	// 这里只是读一个内存中的状态，不产生任何网络请求，因此可以查得比较勤。
 	toolReadinessPollInterval = 2 * time.Second
+	// softRestartPollInterval 软重启闸门期间的轮询间隔（需求8）。
+	// 与 toolReadinessPollInterval 取同值：足够及时地感知恢复，又不会空转烧 CPU。
+	softRestartPollInterval = 2 * time.Second
 )
 
 // infoResult 用于传递 GetInfo 的结果
@@ -626,6 +630,22 @@ func (w *WrappedLive) runScheduler() {
 			case <-w.schedulerCtx.Done():
 				return
 			case <-time.After(toolReadinessPollInterval):
+				continue
+			}
+		}
+
+		// 需求8（软重启）：暂停闸门期间不向平台发起任何请求，实现"切断流量"。
+		//
+		// 与上面的 platformToolsReady 检查同构：调用方仍阻塞在 GetInfoWithInterval 上，
+		// 因此不会产生状态变化、不会误触发开播/停播事件，但确实一个请求都不发出去。
+		// 闸门到期后此处自动放行，既有轮询循环无缝继续，无需重建任何对象。
+		if pause.Default().IsPaused() {
+			select {
+			case <-w.schedulerStop:
+				return
+			case <-w.schedulerCtx.Done():
+				return
+			case <-time.After(softRestartPollInterval):
 				continue
 			}
 		}

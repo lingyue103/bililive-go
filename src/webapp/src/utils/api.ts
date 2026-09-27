@@ -558,6 +558,28 @@ class API {
     refreshFolderSize(ids?: string[]) {
         return utils.requestPost(`${BASE_URL}/folder-size/refresh`, { ids: ids || [] });
     }
+
+    /**
+     * 查询定时软重启状态（需求8）
+     * 返回 { enabled, running, paused, remaining_seconds, until_at, next_run_at, next_run_at_text, recovery_minutes, reason }
+     */
+    getSoftRestartStatus() {
+        return utils.requestGet(`${BASE_URL}/soft-restart/status`);
+    }
+
+    /**
+     * 立即执行一次软重启（需求8）：切断所有直播连接，等待配置的恢复时长后自动恢复
+     */
+    triggerSoftRestart() {
+        return utils.requestPost(`${BASE_URL}/soft-restart/now`, {});
+    }
+
+    /**
+     * 取消正在进行的软重启（需求8）：立刻恢复请求
+     */
+    cancelSoftRestart() {
+        return utils.requestPost(`${BASE_URL}/soft-restart/cancel`, {});
+    }
 }
 
 export default API;

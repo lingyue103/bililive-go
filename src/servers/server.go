@@ -100,6 +100,10 @@ func initMux(ctx context.Context) *mux.Router {
 	apiRoute.HandleFunc("/lives/{id}/one-time", setOneTimeHandler).Methods("POST")
 	// 需求3：手动刷新文件夹大小统计
 	apiRoute.HandleFunc("/folder-size/refresh", refreshFolderSizeHandler).Methods("POST")
+	// 需求8：定时软重启（切断流量一段时间后恢复；本轮不含硬重启）
+	apiRoute.HandleFunc("/soft-restart/status", getSoftRestartStatus).Methods("GET")
+	apiRoute.HandleFunc("/soft-restart/now", triggerSoftRestart).Methods("POST")
+	apiRoute.HandleFunc("/soft-restart/cancel", cancelSoftRestart).Methods("POST")
 	apiRoute.HandleFunc("/lives/{id}/{action}", parseLiveAction).Methods("GET") // 通配符路由必须放在最后
 	apiRoute.HandleFunc("/file/{path:.*}", getFileInfo).Methods("GET")
 	apiRoute.HandleFunc("/file/{path:.*}", renameFile).Methods("PUT")

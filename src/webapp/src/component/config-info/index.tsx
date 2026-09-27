@@ -174,6 +174,18 @@ interface EffectiveConfig {
   };
   // 录制时间段模板（全局，对应后端 configs.RecordScheduleTemplate 列表）
   record_schedule_templates?: RecordScheduleTemplate[];
+  // 定时软重启配置（对应后端 configs.AutoRestartConfig，需求8）
+  auto_restart?: {
+    enable?: boolean;
+    recovery_minutes?: number;
+    schedules?: AutoRestartSchedule[];
+  };
+}
+
+// 定时软重启计划（与后端 configs.AutoRestartSchedule 对齐，需求8）
+interface AutoRestartSchedule {
+  days: number[]; // 0=周日,1=周一,...,6=周六；空数组=每天
+  time: string;   // "HH:MM"
 }
 
 // 录制时间段内的单个时段（与后端 configs.RecordTimeSlot 对齐）
@@ -545,6 +557,88 @@ const ConfigField: React.FC<ConfigFieldProps> = ({
 };
 
 // 全局设置组件
+// SoftRestartActions 软重启的即时操作区（需求8）。
+//
+// 显示当前状态（是否正在切断流量、剩余恢复时间、下次计划时刻），
+// 并提供「立即软重启」与「取消并恢复」两个操作。
+// 暂停期间需要显示倒计时，因此每 5 秒轮询一次状态。
+const SoftRestartActions: React.FC = () => {
+  const [status, setStatus] = useState<any>(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(() => {
+    api.getSoftRestartStatus()
+      .then((res: any) => setStatus(res?.data ?? res ?? null))
+      .catch(() => {
+        // 状态查询失败不影响设置页其它功能，静默忽略
+      });
+  }, []);
+
+  useEffect(() => {
+    load();
+    const timer = setInterval(load, 5000);
+    return () => clearInterval(timer);
+  }, [load]);
+
+  const paused = !!status?.paused;
+  const remain = Number(status?.remaining_seconds || 0);
+  const remainText = remain > 0 ? `${Math.floor(remain / 60)} 分 ${remain % 60} 秒` : '';
+
+  const handleTrigger = () => {
+    setBusy(true);
+    api.triggerSoftRestart()
+      .then(() => {
+        message.success('软重启已开始，将按配置的恢复时长自动恢复');
+        load();
+      })
+      .catch((e: any) => message.error('触发失败: ' + (e?.message || e)))
+      .finally(() => setBusy(false));
+  };
+
+  const handleCancel = () => {
+    setBusy(true);
+    api.cancelSoftRestart()
+      .then(() => {
+        message.success('已取消软重启，请求已恢复');
+        load();
+      })
+      .catch((e: any) => message.error('取消失败: ' + (e?.message || e)))
+      .finally(() => setBusy(false));
+  };
+
+  return (
+    <div style={{ marginTop: 8 }}>
+      {paused ? (
+        <Alert
+          type="warning"
+          showIcon
+          message={`软重启进行中：已切断所有直播连接，${remainText}后自动恢复`}
+          style={{ marginBottom: 10 }}
+        />
+      ) : (
+        <Alert
+          type="info"
+          showIcon
+          message={
+            status?.next_run_at_text
+              ? `当前正常请求中；下次计划软重启：${status.next_run_at_text}`
+              : '当前正常请求中；未启用或未配置计划'
+          }
+          style={{ marginBottom: 10 }}
+        />
+      )}
+      <Space>
+        <Button type="primary" danger disabled={busy || paused} loading={busy} onClick={handleTrigger}>
+          立即软重启
+        </Button>
+        <Button disabled={busy || !paused} onClick={handleCancel}>
+          取消并恢复
+        </Button>
+      </Space>
+    </div>
+  );
+};
+
 const GlobalSettings: React.FC<{
   config: EffectiveConfig;
   onUpdate: (updates: any) => Promise<void>;
@@ -1086,6 +1180,87 @@ const GlobalSettings: React.FC<{
             message="再次开播时若主播名/房间名发生变化，则不适用合并规则，按正常流程独立处理。"
             style={{ marginTop: 8 }}
           />
+        </Card>
+
+        {/* 定时软重启（需求8） */}
+        <Card title="定时软重启" size="small" style={{ marginBottom: 16 }} id="global-auto-restart">
+          <ConfigField
+            label="启用定时软重启"
+            description="软重启：切断所有直播连接（停止录制器 + 不再向平台发起任何请求），等待恢复时长后自动恢复请求。硬重启会重启整个进程，在容器内不可用，故未实现。"
+            valueDisplay={(config.auto_restart?.enable) ? '已启用' : '已禁用'}
+          >
+            <Form.Item name={['auto_restart', 'enable']} valuePropName="checked" noStyle>
+              <Switch />
+            </Form.Item>
+          </ConfigField>
+
+          <ConfigField
+            label="恢复时长"
+            description="切断流量后等待多久自动恢复请求（默认 10 分钟）"
+            valueDisplay={`${config.auto_restart?.recovery_minutes ?? 10} 分钟`}
+          >
+            <Form.Item name={['auto_restart', 'recovery_minutes']} noStyle>
+              <InputNumber min={1} max={1440} style={{ width: 200 }} addonAfter="分钟" />
+            </Form.Item>
+          </ConfigField>
+
+          <ConfigField
+            label="软重启计划"
+            description="可配置多个时间点；星期留空表示每天。时间精度到分钟，保存后立即生效。"
+          >
+            {/* ConfigField 只接受单个子元素（内部会用 cloneElement 注入样式），故包一层 div */}
+            <div>
+              <Form.List name={['auto_restart', 'schedules']}>
+                {(fields, { add, remove }) => (
+                  <>
+                    {fields.length === 0 && (
+                      <div style={{ color: '#888', padding: '4px 0' }}>暂无计划，点击下方按钮添加</div>
+                    )}
+                    {fields.map(({ key, name, ...restField }) => (
+                      <Space key={key} align="baseline" wrap style={{ marginBottom: 8 }}>
+                        <Form.Item {...restField} name={[name, 'days']} noStyle>
+                          <Select
+                            mode="multiple"
+                            style={{ width: 300 }}
+                            placeholder="每天（不选=每天）"
+                            options={WEEKDAY_OPTIONS}
+                          />
+                        </Form.Item>
+                        <Form.Item
+                          {...restField}
+                          name={[name, 'time']}
+                          noStyle
+                          rules={[{ required: true, message: '请选择执行时间' }]}
+                        >
+                          <Input type="time" style={{ width: 130 }} />
+                        </Form.Item>
+                        <Button
+                          type="link"
+                          danger
+                          size="small"
+                          icon={<DeleteOutlined />}
+                          onClick={() => remove(name)}
+                        >
+                          删除
+                        </Button>
+                      </Space>
+                    ))}
+                    <Button
+                      type="dashed"
+                      size="small"
+                      icon={<PlusOutlined />}
+                      onClick={() => add({ days: [], time: '03:00' })}
+                    >
+                      添加计划
+                    </Button>
+                  </>
+                )}
+              </Form.List>
+            </div>
+          </ConfigField>
+
+          {/* 即时操作：立即软重启 / 取消并恢复（含状态与倒计时） */}
+          <SoftRestartActions />
         </Card>
 
         {/* 云盘上传设置（开发中） */}
