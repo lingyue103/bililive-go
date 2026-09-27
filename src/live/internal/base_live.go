@@ -11,6 +11,7 @@ import (
 	"github.com/bililive-go/bililive-go/src/configs"
 	"github.com/bililive-go/bililive-go/src/live"
 	"github.com/bililive-go/bililive-go/src/pkg/livelogger"
+	"github.com/bililive-go/bililive-go/src/pkg/pause"
 	"github.com/bililive-go/bililive-go/src/pkg/utils"
 	"github.com/bililive-go/bililive-go/src/types"
 	"github.com/hr3lxphr6j/requests"
@@ -38,6 +39,8 @@ func NewBaseLive(url *url.URL) BaseLive {
 	config := configs.GetCurrentConfig()
 	if config != nil && config.Debug {
 		client, _ := utils.CreateConnCounterClient()
+		// 需求8：包装传输层，使软重启能够「立即掐断」在途请求（而不只是拦住新请求）
+		client.Transport = pause.WrapTransport(client.Transport)
 		requestSession = requests.NewSession(client)
 	} else {
 		// 注意：这里刻意改变了非调试模式下的默认行为。
@@ -53,6 +56,9 @@ func NewBaseLive(url *url.URL) BaseLive {
 		//       有更高要求，或 edgesrv.com 升级了自身的 TLS 配置，应优先检查并收紧/移除
 		//       utils.CreateDefaultClient 中相关的弱套件配置。
 		client := utils.CreateDefaultClient()
+		// 需求8：同上，包装传输层以便软重启立即掐断在途请求。
+		// CreateDefaultClient 每次返回新构造的 client/transport，因此这里不会重复包装。
+		client.Transport = pause.WrapTransport(client.Transport)
 		requestSession = requests.NewSession(client)
 	}
 

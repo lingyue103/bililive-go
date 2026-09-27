@@ -377,6 +377,15 @@ func (w *WrappedLive) GetInfo() (*Info, error) {
 
 	i, err := w.Live.GetInfo()
 
+	// 需求8（软重启）：被闸门主动掐断的请求不是平台故障，不能计入失败统计 ——
+	// 否则会按"连续失败"触发退避，恢复后迟迟不发下一次请求，白白拉长中断时间。
+	// 这里刻意不调用 recordRequestResult，也就是不更新 lastRequestAt，
+	// 使闸门一放开就能立刻发出恢复后的第一个请求。
+	if err != nil && pause.Default().IsPaused() {
+		w.notifyWaiters(nil, err)
+		return nil, err
+	}
+
 	// 不论成功还是失败都要记录本次请求时间：
 	// 如果失败时不更新 lastRequestAt，调度器会一直认为「早就该请求了」，
 	// 从而退化成固定 3 秒一次的重试，反而把故障状态下的请求频率放大十倍，
