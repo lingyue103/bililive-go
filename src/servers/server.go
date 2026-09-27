@@ -107,6 +107,10 @@ func initMux(ctx context.Context) *mux.Router {
 	apiRoute.HandleFunc("/bilibili/qrcode", getBilibiliQRCode).Methods("GET")
 	apiRoute.HandleFunc("/bilibili/qrcode/poll", pollBilibiliQRCode).Methods("GET")
 	apiRoute.HandleFunc("/bilibili/cookie/verify", verifyBilibiliCookie).Methods("POST")
+	// Douyu Login
+	apiRoute.HandleFunc("/douyu/qrcode", getDouyuQRCode).Methods("GET")
+	apiRoute.HandleFunc("/douyu/qrcode/poll", pollDouyuQRCode).Methods("GET")
+	apiRoute.HandleFunc("/douyu/auth/status", getDouyuAuthStatus).Methods("GET")
 	apiRoute.HandleFunc("/sooplive/auth", getSoopLiveAuthConfig).Methods("GET")
 	apiRoute.HandleFunc("/sooplive/auth", clearSoopLiveAuthConfig).Methods("DELETE")
 	apiRoute.HandleFunc("/sooplive/login", loginSoopLive).Methods("POST")

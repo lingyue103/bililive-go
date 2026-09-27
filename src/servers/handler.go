@@ -30,6 +30,7 @@ import (
 	"github.com/bililive-go/bililive-go/src/instance"
 	"github.com/bililive-go/bililive-go/src/listeners"
 	"github.com/bililive-go/bililive-go/src/live"
+	dy "github.com/bililive-go/bililive-go/src/live/douyu"
 	soop "github.com/bililive-go/bililive-go/src/live/sooplive"
 	"github.com/bililive-go/bililive-go/src/livestate"
 	applog "github.com/bililive-go/bililive-go/src/log"
@@ -39,6 +40,7 @@ import (
 	"github.com/bililive-go/bililive-go/src/pkg/ratelimit"
 	"github.com/bililive-go/bililive-go/src/pkg/utils"
 	"github.com/bililive-go/bililive-go/src/recorders"
+	dmdouyin "github.com/bililive-go/bililive-go/src/recorders/danmaku/douyin"
 	"github.com/bililive-go/bililive-go/src/tools"
 	"github.com/bililive-go/bililive-go/src/types"
 )
@@ -720,9 +722,47 @@ func addLiveImpl(ctx context.Context, urlStr string, isListen bool, notifyOnly b
 	if !strings.HasPrefix(urlStr, "http://") && !strings.HasPrefix(urlStr, "https://") {
 		urlStr = "https://" + urlStr
 	}
+	// 统一别名域名（如手机分享出来的 m.douyu.com），使其与 cookies/平台配置的 host key 对齐
+	urlStr = configs.NormalizeLiveRoomUrl(urlStr)
 	u, err := url.Parse(urlStr)
 	if err != nil {
 		return nil, errors.New("can't parse url: " + urlStr)
+	}
+	// 抖音手机版分享短链入库前转为主播账号级稳定长链：短链 302 固化的房间号是分享那一刻的场次快照，
+	// 主播重新开播后即失效；转成 live.douyin.com/<web_rid> 后视频/弹幕/cookie 全链路与手工长链完全一致。
+	// 转换失败不阻断添加（保留原短链，弹幕侧还有运行时逐跳解析兜底）。
+	if u.Host == "v.douyin.com" {
+		if segs := strings.Split(strings.Trim(u.Path, "/"), "/"); len(segs) > 0 && segs[0] != "" {
+			if longURL, rerr := dmdouyin.ResolveShareLongURL(ctx, segs[0]); rerr == nil {
+				applog.GetLogger().Infof("抖音分享短链已转换为长链: %s -> %s", urlStr, longURL)
+				// 当前配置里若已按原短链入库（配置编辑器粘贴、或存量短链房间重新添加），原位迁移该条目 URL，
+				// 避免"短链条目 + 新增长链条目"双份入库导致重启后同主播重复录制
+				shortURL := urlStr
+				if _, gerr := configs.GetCurrentConfig().GetLiveRoomByUrl(shortURL); gerr == nil {
+					migrate := func(c *configs.Config) error {
+						if r, err := c.GetLiveRoomByUrl(shortURL); err == nil {
+							r.Url = longURL
+						}
+						return nil
+					}
+					var merr error
+					if persist {
+						_, merr = configs.UpdateWithRetry(migrate, 3, 10*time.Millisecond)
+					} else {
+						_, merr = configs.UpdateWithRetryTransient(migrate, 3, 10*time.Millisecond)
+					}
+					if merr != nil {
+						applog.GetLogger().Warnf("抖音短链房间迁移为长链失败: %v", merr)
+					}
+				}
+				urlStr = longURL
+				if u, err = url.Parse(urlStr); err != nil {
+					return nil, errors.New("can't parse url: " + urlStr)
+				}
+			} else {
+				applog.GetLogger().Warnf("抖音分享短链转长链失败，保留原链接: %v", rerr)
+			}
+		}
 	}
 	inst := instance.GetInstance(ctx)
 	needAppend := false
@@ -852,6 +892,7 @@ func batchAddLives(writer http.ResponseWriter, r *http.Request) {
 			if !strings.HasPrefix(checkURL, "http://") && !strings.HasPrefix(checkURL, "https://") {
 				checkURL = "https://" + checkURL
 			}
+			checkURL = configs.NormalizeLiveRoomUrl(checkURL)
 			if u, err := url.Parse(checkURL); err == nil {
 				if _, err := configs.GetCurrentConfig().GetLiveRoomByUrl(u.String()); err == nil {
 					event := batchProgressEvent{
@@ -968,7 +1009,24 @@ func putConfig(writer http.ResponseWriter, r *http.Request) {
 }
 
 func getRawConfig(writer http.ResponseWriter, r *http.Request) {
-	b, err := yaml.Marshal(configs.GetCurrentConfig())
+	// 掩码斗鱼长期凭证后再输出：/api/config 已经用 json:"-" 把 LTP0 挡在 JSON 之外，
+	// 若这里原样吐出 YAML，"设置明文"页就等于把数月有效的票据连同一堆 cookie 一起交给浏览器
+	// （默认 rpc.bind 是 :8080 且接口无鉴权）。用户显式重新扫码才会更换该票据。
+	cfg := configs.CloneConfigShallow(configs.GetCurrentConfig())
+	if cfg == nil {
+		writeJsonWithStatusCode(writer, http.StatusInternalServerError, commonResp{
+			ErrNo:  http.StatusInternalServerError,
+			ErrMsg: "配置尚未加载",
+		})
+		return
+	}
+	if cfg.DouyuAuth.LTP0 != "" {
+		cfg.DouyuAuth.LTP0 = douyuSecretMask
+	}
+	if cfg.DouyuAuth.DyDid != "" {
+		cfg.DouyuAuth.DyDid = douyuSecretMask
+	}
+	b, err := yaml.Marshal(cfg)
 	if err != nil {
 		writeJsonWithStatusCode(writer, http.StatusInternalServerError, commonResp{
 			ErrNo:  http.StatusBadRequest,
@@ -979,6 +1037,16 @@ func getRawConfig(writer http.ResponseWriter, r *http.Request) {
 	writeJSON(writer, map[string]string{
 		"config": string(b),
 	})
+}
+
+// rawConfigTopKeys 取"设置明文"YAML 的顶层键集合，仅用于区分"这一节没提交"与"提交了但为空"。
+// 解析失败返回 nil，此时按"未提交"处理（宁可沿用原凭证，也不静默清掉不可再生的长期票据）。
+func rawConfigTopKeys(yamlText string) map[string]any {
+	var top map[string]any
+	if err := yaml.Unmarshal([]byte(yamlText), &top); err != nil {
+		return nil
+	}
+	return top
 }
 
 func putRawConfig(writer http.ResponseWriter, r *http.Request) {
@@ -993,8 +1061,22 @@ func putRawConfig(writer http.ResponseWriter, r *http.Request) {
 	}
 	ctx := inst.Ctx
 	var jsonBody map[string]any
-	json.Unmarshal(b, &jsonBody)
-	newConfig, err := configs.NewConfigWithBytes([]byte(jsonBody["config"].(string)))
+	if err := json.Unmarshal(b, &jsonBody); err != nil {
+		writeJsonWithStatusCode(writer, http.StatusBadRequest, commonResp{
+			ErrNo:  http.StatusBadRequest,
+			ErrMsg: "请求体不是合法 JSON: " + err.Error(),
+		})
+		return
+	}
+	rawYaml, ok := jsonBody["config"].(string)
+	if !ok {
+		writeJsonWithStatusCode(writer, http.StatusBadRequest, commonResp{
+			ErrNo:  http.StatusBadRequest,
+			ErrMsg: `缺少字符串字段 "config"`,
+		})
+		return
+	}
+	newConfig, err := configs.NewConfigWithBytes([]byte(rawYaml))
 	if err != nil {
 		writeJsonWithStatusCode(writer, http.StatusInternalServerError, commonResp{
 			ErrNo:  http.StatusInternalServerError,
@@ -1002,35 +1084,171 @@ func putRawConfig(writer http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	oldConfig := configs.GetCurrentConfig()
-	// 共享快照不可变：其索引缓存在生成时已由 Update 维护好，
-	// 这里只做只读查找，不能再调用 RefreshLiveRoomIndexCache 写它的 map。
-	// 继承原配置的文件路径
-	newConfig.File = oldConfig.File
-	// 预先将旧配置中的 LiveId 迁移到新配置（相同 URL）
-	oldMap := make(map[string]configs.LiveRoom, len(oldConfig.LiveRooms))
-	for _, room := range oldConfig.LiveRooms {
-		oldMap[room.Url] = room
+	// snapshot 是本次保存的基准（用户打开明文页时所见的配置），只用来判断"这一处用户改没改"。
+	// 真正与提交结果比较的是 prevConfig（提交时刻的配置），见下面的三方合并说明。
+	snapshot := configs.GetCurrentConfig()
+	if snapshot == nil {
+		writeJsonWithStatusCode(writer, http.StatusInternalServerError, commonResp{
+			ErrNo:  http.StatusInternalServerError,
+			ErrMsg: "配置尚未加载",
+		})
+		return
 	}
-	for i := range newConfig.LiveRooms {
-		if rOld, ok := oldMap[newConfig.LiveRooms[i].Url]; ok {
-			newConfig.LiveRooms[i].LiveId = rOld.LiveId
-		}
+	topKeys := rawConfigTopKeys(rawYaml)
+	_, authSectionEdited := topKeys["douyu_auth"]
+	_, cookiesSectionEdited := topKeys["cookies"]
+	// 整体替换必须走带锁的提交路径：SetCurrentConfig 是裸写全局指针，绕开 updateMu 会把与本次
+	// 编辑同期完成的其它更新（保存 cookie、斗鱼自动续期）从内存里覆盖掉；锁外再 Marshal 更是
+	// 直接用这份基于旧快照的配置盖掉别人刚落盘的内容。
+	//
+	// 但只把提交挪进锁里还不够：UpdateWithRetry 每次重试都会把"最新配置的克隆"传进 mutator，
+	// 若 mutator 依旧 *c = *基于入口快照算好的文档，重试就毫无意义（伪重试）——解析这几十毫秒里
+	// 完成的并发写入会被静默覆盖回旧值，且随本次提交一起落盘，内存与磁盘同时倒带。
+	// 实测：4000 条 cookies 的明文提交耗时约 60ms，窗口内的斗鱼续期结果 100% 被抹掉。
+	// 因此所有继承/作废判定都必须以提交时刻的最新配置为基准在闭包内重算一遍（三方合并）。
+	var prevConfig *configs.Config
+	committed, err := configs.UpdateWithRetry(func(c *configs.Config) error {
+		// c 是最新配置的私有克隆：先另存一份提交前状态，供运行态房间差异比对使用
+		prevConfig = configs.CloneConfigShallow(c)
+		prevConfig.RefreshLiveRoomIndexCache()
+		applyRawConfigDoc(c, snapshot, newConfig, authSectionEdited, cookiesSectionEdited)
+		return nil
+	}, 3, 10*time.Millisecond)
+	if err != nil {
+		writeJsonWithStatusCode(writer, http.StatusInternalServerError, commonResp{
+			ErrNo:  http.StatusInternalServerError,
+			ErrMsg: err.Error(),
+		})
+		return
 	}
-	// 先设置为当前全局配置，再驱动运行态差异变更
-	configs.SetCurrentConfig(newConfig)
-	if err := applyLiveRoomsByConfig(ctx, oldConfig, newConfig); err != nil {
+	// 先落配置再驱动运行态差异：新增房间在初始化时会按全局配置取登录 cookie，
+	// 若此时配置还是旧的，新加的房间就以匿名态建连。
+	if err := applyLiveRoomsByConfig(ctx, prevConfig, committed); err != nil {
 		writeJSON(writer, map[string]any{
 			"error": err.Error(),
 		})
 		return
 	}
-	if err := newConfig.Marshal(); err != nil {
-		applog.GetLogger().Error("failed to save config: " + err.Error())
-	}
 	writeJSON(writer, commonResp{
 		Data: "OK",
 	})
+}
+
+// applyRawConfigDoc 把"设置明文"页提交的文档落到提交时刻的最新配置上（结果就地写回 latest）。
+// snapshot 是用户打开该页时的配置，仅用于判断"这一处用户到底改没改"。
+// 三方规则：文档相对快照未改动的内容一律取 latest（保住解析 YAML 这几十毫秒里完成的并发写入），
+// 改动过的取文档值（以用户这次编辑为准）。latest 由 UpdateWithRetry 在锁内传入，是本函数的唯一写入目标。
+func applyRawConfigDoc(latest, snapshot, doc *configs.Config, authSectionEdited, cookiesSectionEdited bool) {
+	// 每次重试都从原始文档重新算：mutator 可能被调用多次，不能污染 doc
+	merged := configs.CloneConfigShallow(doc)
+
+	// 明文页提交的是"整份配置"，但"文档里根本没写这一节"与"写了但留空"含义不同：前者极可能是旧前端
+	// 缓存或局部提交的客户端（它不认识斗鱼登录字段），后者才是用户显式清空。不区分的话，一次普通保存
+	// 就把不可再生的长期凭证连同续期日程静默抹掉，表现为自动续期永久失效且没有任何提示（只能重新扫码）。
+	// 实测：把 GET /raw-config 的响应体原样提交回去（YAML 里两节都缺）即可复现。
+	//
+	// 掩码是服务端自己写进文档的，不能算用户改动，所以判"改没改"要先把掩码换回快照里的原值再比。
+	docAuth := doc.DouyuAuth
+	if docAuth.LTP0 == douyuSecretMask {
+		docAuth.LTP0 = snapshot.DouyuAuth.LTP0
+	}
+	if docAuth.DyDid == douyuSecretMask {
+		docAuth.DyDid = snapshot.DouyuAuth.DyDid
+	}
+	if !authSectionEdited || docAuth == snapshot.DouyuAuth {
+		// 整节没提交、或整节照抄没改（只想改别的东西时最常见）：续期日程、失效标记这些机器字段以最新值为准，
+		// 否则一次普通保存就会把 keeper 刚写进去的 NextRefreshAt/NeedRescan/LastRenewSuccessAt 倒回入口快照。
+		merged.DouyuAuth = latest.DouyuAuth
+	} else {
+		// 用户确实编辑了这一段：文档里的掩码仍要还原成最新票据，否则"打开明文页点一次保存"
+		// 就会把掩码字符串本身当成票据存下来。真正要清除时留空 ltp0 即可。
+		if merged.DouyuAuth.LTP0 == douyuSecretMask {
+			merged.DouyuAuth.LTP0 = latest.DouyuAuth.LTP0
+		}
+		if merged.DouyuAuth.DyDid == douyuSecretMask {
+			merged.DouyuAuth.DyDid = latest.DouyuAuth.DyDid
+		}
+	}
+
+	// cookies 同理做逐主机三方合并：用户在编辑器里没动过的那条，若已被后台续期改写，取最新值。
+	// 整节缺失视为"这一节没提交"（局部客户端不认识它），不是"把所有登录 cookie 清空"。
+	if !cookiesSectionEdited {
+		merged.Cookies = cloneStrMap(latest.Cookies)
+	} else {
+		merged.Cookies = mergeCookies(snapshot.Cookies, doc.Cookies, latest.Cookies)
+	}
+
+	// OpenList 令牌由出封面阶段在每次轮换后自动回写，文档里带的还是打开页面那一刻的旧值：
+	// 用户没改过这一项就取最新值，否则一次保存把新令牌倒回去，下次上传得重新登录。
+	if doc.OpenList.Token == snapshot.OpenList.Token {
+		merged.OpenList.Token = latest.OpenList.Token
+	}
+
+	// 继承原配置的文件路径
+	merged.File = latest.File
+	// 预先将旧配置中的 LiveId 迁移到新配置（相同 URL）
+	oldMap := make(map[string]configs.LiveRoom, len(latest.LiveRooms))
+	for _, room := range latest.LiveRooms {
+		oldMap[room.Url] = room
+	}
+	for i := range merged.LiveRooms {
+		if rOld, ok := oldMap[merged.LiveRooms[i].Url]; ok {
+			merged.LiveRooms[i].LiveId = rOld.LiveId
+		}
+	}
+	// 手工编辑"设置明文"里的斗鱼 cookie，只有换了登录账号才算换掉了一份登录态：按 acf_uid 判断。
+	// 不能整串比较后一律清票据——补一个字段、删一个过期字段这类同账号微调非常常见，
+	// 顺手清掉长期凭证的结果是自动续期静默失效，用户只看到"过几天又断流"却毫无线索。
+	// 反之若真的换了账号却保留盘上的 LTP0，后台下次排期会用原账号换票并把它的 acf_* 合并回来，
+	// 表现为"我手改的 cookie 过几天自己变了回去"（静默混号）。宁可放弃自动续期，也不能悄悄换人。
+	// 比较的是三方合并后的最终登录态与当前盘上的登录态：同账号微调、或根本没提交这一节都不会触发。
+	if oldUid, newUid := douyuCookieUid(latest.Cookies[dy.CookieHost]), douyuCookieUid(merged.Cookies[dy.CookieHost]); oldUid != newUid {
+		// cookies 整节缺失时 newUid 必然为空，那不是"换了账号"而是"没提交这一节"，不能据此作废票据。
+		if cookiesSectionEdited {
+			if merged.DouyuAuth.LTP0 != "" {
+				applog.GetLogger().Warnf("检测到斗鱼登录 Cookie 换了账号（acf_uid %s -> %s），已同时清除斗鱼长期凭证（需重新扫码才能启用自动续期）", oldUid, newUid)
+			}
+			merged.DouyuAuth = configs.DouyuAuth{}
+		}
+	}
+	// 票据因"未提交该节"而被沿用、登录 cookie 却已不在（cookies 整节被局部提交带走）时，
+	// 把排期改为"立即"：否则要空转到原排期（最长 3 天）才换回登录态，中间一直是匿名录制。
+	if merged.DouyuAuth.LTP0 != "" && douyuCookieUid(merged.Cookies[dy.CookieHost]) == "" {
+		merged.DouyuAuth.NextRefreshAt = 0
+	}
+	*latest = *merged
+}
+
+// mergeCookies 逐主机三方合并 cookies：snapshot 是用户打开页面所见，doc 是提交内容，latest 是当前最新值。
+// 文档里没写这条主机时，区分"用户把它删了"（快照里有）与"提交期间别人才加上"（快照里没有），后者要保留。
+func mergeCookies(snapshot, doc, latest map[string]string) map[string]string {
+	merged := make(map[string]string, len(doc)+len(latest))
+	for host, cookie := range doc {
+		if old, ok := snapshot[host]; ok && old == cookie {
+			// 用户没动这一条：以最新值为准（斗鱼自动续期可能已经把它换掉了）
+			if cur, ok := latest[host]; ok {
+				cookie = cur
+			}
+		}
+		merged[host] = cookie
+	}
+	for host, cookie := range latest {
+		if _, inDoc := doc[host]; inDoc {
+			continue
+		}
+		if _, wasInSnapshot := snapshot[host]; !wasInSnapshot {
+			merged[host] = cookie
+		}
+	}
+	return merged
+}
+
+func cloneStrMap(src map[string]string) map[string]string {
+	cp := make(map[string]string, len(src))
+	for k, v := range src {
+		cp[k] = v
+	}
+	return cp
 }
 
 func applyLiveRoomsByConfig(ctx context.Context, oldConfig *configs.Config, newConfig *configs.Config) error {
@@ -2867,6 +3085,11 @@ func getLiveHostCookie(writer http.ResponseWriter, r *http.Request) {
 	inst := instance.GetInstance(r.Context())
 	hostCookieMap := make(map[string]*live.InfoCookie)
 	keys := make([]string, 0)
+	// 配置在启动早期可能尚未就绪，取一次快照统一使用，避免逐房间重复解引用
+	allCookies := map[string]string{}
+	if cfg := configs.GetCurrentConfig(); cfg != nil {
+		allCookies = cfg.Cookies
+	}
 	inst.Lives.Range(func(_ types.LiveID, v live.Live) bool {
 		urltmp, _ := url.Parse(v.GetRawUrl())
 		if _, ok := hostCookieMap[urltmp.Host]; ok {
@@ -2874,7 +3097,7 @@ func getLiveHostCookie(writer http.ResponseWriter, r *http.Request) {
 		}
 		host := urltmp.Host
 		platformName := v.GetPlatformCNName()
-		if cookie, ok := configs.GetCurrentConfig().Cookies[host]; ok {
+		if cookie, ok := allCookies[host]; ok {
 			tmp := &live.InfoCookie{Platform_cn_name: platformName, Host: host, Cookie: cookie}
 			hostCookieMap[host] = tmp
 		} else {
@@ -2884,6 +3107,18 @@ func getLiveHostCookie(writer http.ResponseWriter, r *http.Request) {
 		keys = append(keys, host)
 		return true
 	})
+	// 斗鱼扫码入口兜底：列表行只由"运行中的房间 host"推导，用户删掉全部斗鱼房间后
+	// 既看不到自动续期失败提醒、也无法重新扫码。只要后端仍持有斗鱼凭证就固定补一行。
+	if cfg := configs.GetCurrentConfig(); cfg != nil {
+		if _, ok := hostCookieMap[dy.CookieHost]; !ok && (cfg.DouyuAuth.LTP0 != "" || cfg.Cookies[dy.CookieHost] != "") {
+			hostCookieMap[dy.CookieHost] = &live.InfoCookie{
+				Platform_cn_name: "斗鱼",
+				Host:             dy.CookieHost,
+				Cookie:           cfg.Cookies[dy.CookieHost],
+			}
+			keys = append(keys, dy.CookieHost)
+		}
+	}
 	sort.Strings(keys)
 	result := make([]*live.InfoCookie, 0)
 	for _, v := range keys {
@@ -2892,6 +3127,10 @@ func getLiveHostCookie(writer http.ResponseWriter, r *http.Request) {
 	writeJSON(writer, result)
 }
 
+// applyCookiesToLives 把 newCfg 中属于 hosts 的房间重新套用 cookie。
+// 注意：newCfg 只用于"枚举哪些房间要刷新"，实际生效的 cookie 由
+// UpdateLiveOptionsbyConfig 从全局当前配置现读；因此调用方必须在
+// 配置更新（CAS 提交）成功之后调用，否则刷到的可能是并发写入的更新值。
 func applyCookiesToLives(ctx context.Context, newCfg *configs.Config, hosts ...string) {
 	inst := instance.GetInstance(ctx)
 	hostSet := make(map[string]struct{}, len(hosts))
@@ -2938,7 +3177,9 @@ func putLiveHostCookie(writer http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	data := gjson.ParseBytes(b)
 
-	host := data.Get("Host").Str
+	// host 先归一为标准域名：房间 URL 与 Cookies 键都用标准 host，别名提交若不归一，
+	// 斗鱼分支（清长期凭证）和热应用（按 host 匹配房间）都会静默不命中。
+	host := configs.NormalizeCookieHost(data.Get("Host").Str)
 	cookie := data.Get("Cookie").Str
 	if cookie == "" {
 
@@ -2953,7 +3194,40 @@ func putLiveHostCookie(writer http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// 使用统一 Update 接口更新 Cookies
-	newCfg, err := configs.SetCookie(host, cookie)
+	// 斗鱼特殊处理：手动改写/清空 cookie 视为用户显式接管登录态，必须同时清除长期凭证 LTP0 与续期日程，
+	// 否则后台 keeper 会在下次续期时用旧 LTP0 换票，把用户刚写入（或删除）的 cookie 覆盖回去（幽灵恢复/静默换账号）。
+	var newCfg *configs.Config
+	if host == dy.CookieHost {
+		newCfg, err = configs.UpdateWithRetry(func(c *configs.Config) error {
+			// 浏览器导出的 www.douyu.com cookie 常连带 passport 域的 LTP0（domain=.douyu.com）。
+			// 长期凭证只应留在 DouyuAuth.LTP0 一处：混进 Cookies 后 /api/cookies 会把它明文回传浏览器，
+			// 而且请求主站本来也不需要这张票。
+			stored := configs.DropCookieFields(strings.TrimSpace(cookie), "LTP0")
+			oldUid := douyuCookieUid(c.Cookies[host])
+			if stored == "" {
+				delete(c.Cookies, host)
+			} else {
+				if c.Cookies == nil {
+					c.Cookies = make(map[string]string)
+				}
+				c.Cookies[host] = stored
+			}
+			// 只在"换账号"或"显式存一份未登录 cookie"时作废票据，而不是只要动过 cookie 就清：
+			// 同账号补/删非登录字段很常见，顺手清掉票据会让自动续期从此静默失效，
+			// 用户只看到"过几天又断流"。反之新的 cookie 里没有 acf_uid，说明用户在主动退出登录，
+			// 留着票据就会被后台换票恢复成登录态。
+			newUid := douyuCookieUid(stored)
+			if newUid != oldUid || newUid == "" {
+				if c.DouyuAuth.LTP0 != "" {
+					applog.GetLogger().Warnf("斗鱼登录 Cookie 被手工替换为另一份登录态（acf_uid %s -> %s），已清除长期凭证（需重新扫码才能启用自动续期）", oldUid, newUid)
+				}
+				c.DouyuAuth = configs.DouyuAuth{}
+			}
+			return nil
+		}, 3, 10*time.Millisecond)
+	} else {
+		newCfg, err = configs.SetCookie(host, cookie)
+	}
 	if err != nil {
 		writeJsonWithStatusCode(writer, http.StatusInternalServerError, commonResp{
 			ErrNo:  http.StatusInternalServerError,
@@ -2962,9 +3236,8 @@ func putLiveHostCookie(writer http.ResponseWriter, r *http.Request) {
 		return
 	}
 	applyCookiesToLives(ctx, newCfg, host)
-	if err := newCfg.Marshal(); err != nil {
-		applog.GetLogger().Error("failed to persistence config: " + err.Error())
-	}
+	// 不再额外 Marshal：上面的 UpdateWithRetry/SetCookie 已在 updateMu 锁内落过盘。
+	// 在锁外重写同一个快照，会把期间后台续期刚写好的 DouyuAuth/新 cookie 盖回旧值（盘上比内存旧，重启才显现）。
 	writeJSON(writer, commonResp{
 		Data: "OK",
 	})
@@ -3581,48 +3854,81 @@ func pollBilibiliQRCode(writer http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 尝试解析响应，如果是成功状态，尝试从 Cookie 中提取 sid 并附加到 URL
-	var result struct {
-		Code int `json:"code"`
-		Data struct {
-			Code int    `json:"code"`
-			Url  string `json:"url"`
-		} `json:"data"`
+	// 登录成功时 B 站把凭证放在响应头 Set-Cookie 里下发，body 的 data.url 只有一个跳转地址，
+	// 前端光解析 data.url 拼不出 SESSDATA，所以这里把登录字段补进 data.cookies 再回传。
+	body = attachBilibiliLoginCookies(body, resp.Cookies())
+
+	writer.Header().Set("Content-Type", "application/json")
+	writer.Write(body)
+}
+
+// biliLoginCookieNames 是录制与弹幕真正需要的 B 站 Cookie 字段。
+// buvid、_uuid 这类埋点字段不回传，避免被写进配置文件。
+var biliLoginCookieNames = map[string]bool{
+	"SESSDATA":          true,
+	"bili_jct":          true,
+	"DedeUserID":        true,
+	"DedeUserID__ckMd5": true,
+	"sid":               true,
+}
+
+// attachBilibiliLoginCookies 在轮询返回登录成功时，把登录字段汇总到 data.cookies，
+// 其余上游字段原样保留；非成功状态或解析失败都返回原始 body。
+func attachBilibiliLoginCookies(body []byte, cookies []*http.Cookie) []byte {
+	var result map[string]interface{}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	// 必须用 UseNumber：默认会把所有数字解析成 float64，重新 Marshal 时
+	// 超过 2^53 的整数（B 站以后可能回 mid/room_id 这类大整数）会被静默截断成近似值。
+	decoder.UseNumber()
+	if err := decoder.Decode(&result); err != nil {
+		applog.GetLogger().Error("轮询登录状态解析 JSON 失败: " + err.Error())
+		return body
+	}
+	data, ok := result["data"].(map[string]interface{})
+	if !ok || !isJSONZero(result["code"]) || !isJSONZero(data["code"]) {
+		return body
 	}
 
-	if err := json.Unmarshal(body, &result); err != nil {
-		applog.GetLogger().Error("轮询登录状态解析 JSON 失败: " + err.Error())
-	} else if result.Code == 0 && result.Data.Code == 0 && result.Data.Url != "" {
-		// 登录成功，检查响应头中的 Cookie
-		u, err := url.Parse(result.Data.Url)
-		if err != nil {
-			applog.GetLogger().Error("解析登录回调 URL 失败: " + err.Error() + ", URL: " + result.Data.Url)
-		} else {
-			q := u.Query()
-			foundExtra := false
-			if resp.Response != nil {
-				for _, cookie := range resp.Cookies() {
-					if cookie.Name == "sid" && q.Get("sid") == "" {
-						q.Set("sid", cookie.Value)
-						foundExtra = true
-					}
-				}
-			}
-			if foundExtra {
-				u.RawQuery = q.Encode()
-				result.Data.Url = u.String()
-				newBody, err := json.Marshal(result)
-				if err != nil {
-					applog.GetLogger().Error("序列化增强后的登录结果失败: " + err.Error())
-				} else {
-					body = newBody
+	login := make(map[string]string)
+	// 上游也可能把字段挂在 data.url 的 query 上（原实现只从 URL 里取 sid），这里一并收进来，
+	// 同名时 Set-Cookie 的值优先。
+	if rawURL, _ := data["url"].(string); rawURL != "" {
+		if u, err := url.Parse(rawURL); err == nil {
+			for name, values := range u.Query() {
+				if biliLoginCookieNames[name] && len(values) > 0 {
+					login[name] = values[0]
 				}
 			}
 		}
 	}
+	for _, c := range cookies {
+		if biliLoginCookieNames[c.Name] && c.Value != "" {
+			login[c.Name] = c.Value
+		}
+	}
+	if len(login) == 0 {
+		return body
+	}
 
-	writer.Header().Set("Content-Type", "application/json")
-	writer.Write(body)
+	data["cookies"] = login
+	newBody, err := json.Marshal(result)
+	if err != nil {
+		applog.GetLogger().Error("序列化增强后的登录结果失败: " + err.Error())
+		return body
+	}
+	return newBody
+}
+
+// isJSONZero 判断 json 数值字段是否为 0（配合 UseNumber，数值是 json.Number）。
+func isJSONZero(v interface{}) bool {
+	switch number := v.(type) {
+	case json.Number:
+		return number.String() == "0"
+	case float64:
+		return number == 0
+	default:
+		return false
+	}
 }
 
 // verifyBilibiliCookie 验证哔哩哔哩 Cookie 有效性
@@ -3653,6 +3959,104 @@ func verifyBilibiliCookie(writer http.ResponseWriter, r *http.Request) {
 	}
 	writer.Header().Set("Content-Type", "application/json")
 	writer.Write(body)
+}
+
+// getDouyuQRCode 获取斗鱼扫码登录二维码（后端代理 passport.douyu.com，
+// 规避跨域与 WAF 对非浏览器来源请求的拦截）
+func getDouyuQRCode(writer http.ResponseWriter, r *http.Request) {
+	session, err := dy.GenerateLoginQRCode(r.Context())
+	if err != nil {
+		applog.GetLogger().WithError(err).Warn("获取斗鱼登录二维码失败")
+		writeJsonWithStatusCode(writer, http.StatusInternalServerError, commonResp{
+			ErrNo:  http.StatusInternalServerError,
+			ErrMsg: "获取斗鱼登录二维码失败: " + err.Error(),
+		})
+		return
+	}
+	writeJSON(writer, commonResp{Data: session})
+}
+
+// pollDouyuQRCode 轮询斗鱼扫码登录状态；用户在手机端确认成功后，
+// 后端自动用回调 URL 换取登录 cookie 并写入 configs.Cookies["www.douyu.com"]，
+// 同步应用到运行中的斗鱼房间（录制流请求将携带该 cookie，消除约 5 分钟的匿名断流）。
+func pollDouyuQRCode(writer http.ResponseWriter, r *http.Request) {
+	code := r.URL.Query().Get("code")
+	result, err := dy.PollLoginQRCode(r.Context(), code)
+	if err != nil {
+		applog.GetLogger().WithError(err).Warn("轮询斗鱼登录状态失败")
+		writeJsonWithStatusCode(writer, http.StatusInternalServerError, commonResp{
+			ErrNo:  http.StatusInternalServerError,
+			ErrMsg: "轮询斗鱼登录状态失败: " + err.Error(),
+		})
+		return
+	}
+
+	if result.State == dy.QRStateSuccess {
+		newCfg, err := configs.UpdateWithRetry(func(c *configs.Config) error {
+			applyDouyuScanResult(c, result, time.Now())
+			return nil
+		}, 3, 10*time.Millisecond)
+		if err != nil {
+			// 手机端已经确认登录、票据已消耗，回 HTTP 500 会让前端只看到"查询连续失败"，
+			// 用户以为是网络问题而反复重扫。用独立状态把"保存失败"这个真相送到界面上。
+			applog.GetLogger().WithError(err).Error("斗鱼扫码登录成功但写入配置失败")
+			result.State = dy.QRStateSaveFailed
+			result.Msg = err.Error()
+			writeJSON(writer, commonResp{Data: result})
+			return
+		}
+		// 扫码已经拿到全新登录态，为"上一轮写盘失败"记的内存退避到此失去意义：
+		// 不退避就会让 keeper 在几小时后拿刚扫到的新鲜 cookie 再打一次 safeAuth。
+		clearRenewScheduleOverride()
+		// 同理复位进程内的提醒去重标记：用户按提示重扫成功后，若还是这张票据又出了同样的问题，
+		// 必须还能再提醒一次，否则"我扫过了却又断了"将彻底无声。
+		noteRenewHealthy()
+		applyCookiesToLives(r.Context(), newCfg, dy.CookieHost)
+		applog.GetLogger().Infof("斗鱼扫码登录成功: uid=%s nickname=%s cookieLength=%d gotLTP0=%t", result.UserID, result.Nickname, len(result.Cookie), result.LTP0 != "")
+	}
+
+	// 不回传原始 cookie 内容，前端需要时可经 /api/cookies 查看；
+	// LTP0/dy_did 是 passport 域长期凭证，绝不能下发给前端，仅留在后端配置中用于续期。
+	result.Cookie = ""
+	result.LTP0 = ""
+	result.DyDid = ""
+	writeJSON(writer, commonResp{Data: result})
+}
+
+// douyuAuthStatus 斗鱼登录态自动续期的前端可见状态。
+// 只暴露状态与时间点，绝不回传 LTP0/dy_did/cookie 原文。
+type douyuAuthStatus struct {
+	LoggedIn      bool  `json:"logged_in"`       // 登录态是否可用（有 acf_uid，且续期链路没有长期停摆）
+	HasLTP0       bool  `json:"has_ltp0"`        // 是否已绑定扫码引导的长期凭证
+	NeedRescan    bool  `json:"need_rescan"`     // 自动续期是否已判定凭证失效、需重新扫码
+	NextRefreshAt int64 `json:"next_refresh_at"` // 下次自动续期的 Unix 秒；0 表示尚未排期
+}
+
+// getDouyuAuthStatus 供 Web 界面展示斗鱼 cookie 自动续期健康状况（续期失败提醒等）
+func getDouyuAuthStatus(writer http.ResponseWriter, r *http.Request) {
+	cfg := configs.GetCurrentConfig()
+	if cfg == nil {
+		writeJsonWithStatusCode(writer, http.StatusInternalServerError, commonResp{
+			ErrNo:  http.StatusInternalServerError,
+			ErrMsg: "配置尚未加载",
+		})
+		return
+	}
+	auth := cfg.DouyuAuth
+	loggedIn := douyuCookieUid(cfg.Cookies[dy.CookieHost]) != ""
+	// cookie 里有 acf_uid 只代表"曾经登录过"，不代表现在还在有效期内（主站 cookie 约 6 天）。
+	// 判据与录制侧共用 dy.LoginCookieKnownExpired：界面说"未登录"和录制端"不再发这份 cookie"
+	// 必须同口径，两处各留一份阈值迟早会漂移（表现为界面绿着却一直在匿名录制，或反过来
+	// 界面报未登录而实际还能用）。没有 LTP0（手填 cookie、历史配置）时没有任何过期证据，不据此判未登录。
+	if loggedIn && dy.LoginCookieKnownExpired(auth.LTP0, auth.LastRenewSuccessAt, time.Now()) {
+		loggedIn = false
+	}
+	writeJSON(writer, commonResp{Data: douyuAuthStatus{
+		LoggedIn:      loggedIn,
+		HasLTP0:       auth.LTP0 != "",
+		NeedRescan:    auth.NeedRescan,
+		NextRefreshAt: effectiveNextRefreshAt(cfg), // 内存退避也要计入，否则界面显示的续期时间比实际早
+	}})
 }
 
 // startRecordDirect 直接启动录制（绕过 Listener，适用于 NotifyOnly 房间）

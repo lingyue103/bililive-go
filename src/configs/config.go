@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -547,6 +548,26 @@ type SoopLiveAuth struct {
 	Password string `yaml:"password,omitempty" json:"password,omitempty"`
 }
 
+// DouyuAuth 保存斗鱼 passport 域的长期凭证，用于通过 safeAuth 自动续期主站登录 cookie。
+// LTP0 是数月有效的长期票据，主站 acf_* 登录 cookie 仅约 6 天有效，需定期用 LTP0 换新的。
+// LTP0/DyDid 标记 json:"-"：它们只用于 YAML 落盘，绝不通过 /api/config 等 JSON 接口下发给浏览器
+// （GET /api/config 直接序列化整个 Config，若保留 json tag 会把数月有效的长期凭证暴露给前端）。
+type DouyuAuth struct {
+	LTP0  string `yaml:"ltp0,omitempty" json:"-"`
+	DyDid string `yaml:"dy_did,omitempty" json:"-"` // 可选，实测缺失也能发权
+	// NextRefreshAt 是下次应续期的 Unix 秒时间戳（0 表示未知/立即续期）。
+	// 后台 keeper 平时只做廉价时间比较，到点才真正发起 safeAuth 换票，避免无谓轮换。
+	NextRefreshAt int64 `yaml:"next_refresh_at,omitempty" json:"next_refresh_at,omitempty"`
+	// NeedRescan 标记"自动续期已因凭证失效而失败、已通知用户重新扫码"，用于去重：
+	// 失效时只推送一次通知，续期成功或重新扫码后清除。
+	NeedRescan bool `yaml:"need_rescan,omitempty" json:"need_rescan,omitempty"`
+	// LastRenewSuccessAt 是上一次"拿到新鲜登录态"（自动续期成功或扫码登录成功）的 Unix 秒时间戳，
+	// 0 表示该字段引入前从未成功过（此时不据其升级提醒）。
+	// 用途：网络类失败默认只静默退避，但若距上次成功已超过主站 cookie 的整个有效期，
+	// 说明"临时错误"实际已让登录态彻底过期，必须升级为失效提醒，否则会长期匿名录制却毫无提示。
+	LastRenewSuccessAt int64 `yaml:"last_renew_success_at,omitempty" json:"last_renew_success_at,omitempty"`
+}
+
 // Config content all config info.
 type Config struct {
 	// 核心配置
@@ -579,6 +600,9 @@ type Config struct {
 
 	// SoopLive 账号配置
 	SoopLiveAuth SoopLiveAuth `yaml:"sooplive_auth,omitempty" json:"sooplive_auth,omitempty"`
+
+	// 斗鱼长期凭证配置（用于主站 cookie 自动续期）
+	DouyuAuth DouyuAuth `yaml:"douyu_auth,omitempty" json:"douyu_auth,omitempty"`
 
 	// 通知服务配置
 	Notify Notify `yaml:"notify" json:"notify"`
@@ -840,8 +864,9 @@ func SetDebug(v bool) (*Config, error) {
 	return UpdateWithRetry(func(c *Config) error { c.Debug = v; return nil }, 3, 10*time.Millisecond)
 }
 
-// SetCookie 设置某个 host 的 Cookie。
+// SetCookie 设置某个 host 的 Cookie。host 会先归一为标准域名，避免别名写入后房间取不到。
 func SetCookie(host, cookie string) (*Config, error) {
+	host = NormalizeCookieHost(host)
 	return UpdateWithRetry(func(c *Config) error {
 		if c.Cookies == nil {
 			c.Cookies = make(map[string]string)
@@ -856,11 +881,22 @@ func SetCookie(host, cookie string) (*Config, error) {
 }
 
 func SetCookies(hostCookies map[string]string) (*Config, error) {
+	normalized := make(map[string]string, len(hostCookies))
+	for host, cookie := range hostCookies {
+		std := NormalizeCookieHost(host)
+		// 同一批里别名与标准键并存时以标准键为准，不能由 map 遍历顺序决定谁生效
+		if std != host {
+			if _, ok := hostCookies[std]; ok {
+				continue
+			}
+		}
+		normalized[std] = cookie
+	}
 	return UpdateWithRetry(func(c *Config) error {
 		if c.Cookies == nil {
 			c.Cookies = make(map[string]string)
 		}
-		for host, cookie := range hostCookies {
+		for host, cookie := range normalized {
 			if strings.TrimSpace(cookie) == "" {
 				delete(c.Cookies, host)
 				continue
@@ -1086,6 +1122,106 @@ func newConfigPostProcess(c *Config) {
 	if c.AppDataPath == "" {
 		c.AppDataPath = filepath.Join(c.OutPutPath, ".appdata")
 	}
+	// 规范化手动编辑配置写入的别名域名房间（如 m.douyu.com → www.douyu.com），
+	// 保证 cookies/平台配置按统一 host 命中。LiveId 是不持久化的瞬时字段（yaml:"-"），
+	// 加载阶段恒为空，改写 URL 不会与任何已缓存的 LiveId 失配。
+	for i := range c.LiveRooms {
+		c.LiveRooms[i].Url = NormalizeLiveRoomUrl(c.LiveRooms[i].Url)
+	}
+	// 规范化后同一房间的不同写法（m.douyu.com/1 与 www.douyu.com/1；live_web_rid query 形态与长链）
+	// 会变成完全相同的 URL。老版本存量条目 + 升级后经 UI 正常添加的条目就会各占一行，
+	// 加载不去重则同一房间建出两个 Live、开播双录。合并策略：保留第一条，
+	// is_listening 任一为真即为真，notify_only 全部为真才为真（宁可多录，不漏录），
+	// 其余房间级设置按 mergeDuplicatedRoom 补齐——整条丢弃会把用户在重复条目上单独配的
+	// 原画/输出目录/转 mp4 无声抹掉，并随本次加载写回磁盘（重启也回不来）。
+	if len(c.LiveRooms) > 1 {
+		seen := make(map[string]int, len(c.LiveRooms))
+		deduped := c.LiveRooms[:0]
+		for _, room := range c.LiveRooms {
+			if idx, ok := seen[room.Url]; ok {
+				adopted, conflicted := mergeDuplicatedRoom(&deduped[idx], room)
+				fmt.Fprintf(os.Stderr, "[Config] 检测到规范化后重复的房间 %s，已合并到先线条目（补齐 %s；冲突保留先条 %s）\n",
+					room.Url, joinOrNone(adopted), joinOrNone(conflicted))
+				continue
+			}
+			seen[room.Url] = len(deduped)
+			deduped = append(deduped, room)
+		}
+		c.LiveRooms = deduped
+	}
+	// cookies 的 host key 同样归一：房间 URL 归一后按标准 host 查 cookie，
+	// 手工编辑时写的 douyu.com / m.douyu.com 必须能对上，否则登录态静默失效。
+	c.Cookies = normalizeCookieHostKeys(c.Cookies)
+	// LTP0 只该存在 DouyuAuth.LTP0 一处：它是扫码那一刻由 passport 域下发的数月有效期长期凭证，
+	// 混进 Cookies 就会跟着 cookie 串一起从 /api/config 的 JSON 和"设置明文"的 YAML 两个出口漏出去。
+	// 这里是加载侧的总闸（NewConfig / NewConfigWithBytes 都经过它，"设置明文"保存也先经后者解析），
+	// 但 Marshal 并不调用本函数，运行期往 Cookies 里写值的入口仍须各自剔除，见 DropCookieFields 调用处。
+	stripCookieFields(c.Cookies, "LTP0")
+}
+
+// mergeDuplicatedRoom 把去重时被丢弃的条目 dropped 合并进保留条目 keep，
+// 返回"从丢弃条目补齐到保留条目的字段"与"两边都设置、只能保留先条的字段"。
+//
+// 为什么必须逐字段合而不是整条丢弃：房间 URL 规范化后，同一个房间的历史写法（m.douyu.com/1）
+// 和新写法（www.douyu.com/1）会并成一条，而用户很可能把画质、输出目录、转 mp4 这类设置配在
+// 后一条上。整条丢弃会把这些值无声清零，并随本次加载一起写回磁盘，重启也回不来。
+// 口径：先线条目为准，只在它"没设置"（零值 / 指针为 nil）时用后线条目的值补齐。
+func mergeDuplicatedRoom(keep *LiveRoom, dropped LiveRoom) (adopted, conflicted []string) {
+	if dropped.IsListening {
+		keep.IsListening = true
+	}
+	if !dropped.NotifyOnly {
+		keep.NotifyOnly = false
+	}
+	// 值类型字段：零值即"这条写法没设置"
+	mergeRoomValue("quality", &keep.Quality, dropped.Quality, &adopted, &conflicted)
+	mergeRoomValue("audio_only", &keep.AudioOnly, dropped.AudioOnly, &adopted, &conflicted)
+	mergeRoomValue("nick_name", &keep.NickName, dropped.NickName, &adopted, &conflicted)
+	mergeRoomValue("scheme", &keep.SchemeUrl, dropped.SchemeUrl, &adopted, &conflicted)
+	// 房间级覆盖项全部是指针，nil 即未设置；两边都设置时只能保住先条（比指针不比内容）
+	mergeRoomPtr("interval", &keep.Interval, dropped.Interval, &adopted, &conflicted)
+	mergeRoomPtr("out_put_path", &keep.OutPutPath, dropped.OutPutPath, &adopted, &conflicted)
+	mergeRoomPtr("ffmpeg_path", &keep.FfmpegPath, dropped.FfmpegPath, &adopted, &conflicted)
+	mergeRoomPtr("log", &keep.Log, dropped.Log, &adopted, &conflicted)
+	mergeRoomPtr("feature", &keep.Feature, dropped.Feature, &adopted, &conflicted)
+	mergeRoomPtr("out_put_tmpl", &keep.OutputTmpl, dropped.OutputTmpl, &adopted, &conflicted)
+	mergeRoomPtr("video_split_strategies", &keep.VideoSplitStrategies, dropped.VideoSplitStrategies, &adopted, &conflicted)
+	mergeRoomPtr("on_record_finished", &keep.OnRecordFinished, dropped.OnRecordFinished, &adopted, &conflicted)
+	mergeRoomPtr("timeout_in_us", &keep.TimeoutInUs, dropped.TimeoutInUs, &adopted, &conflicted)
+	mergeRoomPtr("stream_preference", &keep.StreamPreference, dropped.StreamPreference, &adopted, &conflicted)
+	mergeRoomPtr("danmaku_enable", &keep.DanmakuEnable, dropped.DanmakuEnable, &adopted, &conflicted)
+	mergeRoomPtr("danmaku", &keep.Danmaku, dropped.Danmaku, &adopted, &conflicted)
+	return adopted, conflicted
+}
+
+// mergeRoomValue 保留条目该字段为未设置（零值）时采用丢弃条目的值；两边都设置且不同记为冲突。
+func mergeRoomValue[T comparable](name string, dst *T, src T, adopted, conflicted *[]string) {
+	var zero T
+	switch {
+	case *dst == zero && src != zero:
+		*dst = src
+		*adopted = append(*adopted, name)
+	case *dst != src && src != zero:
+		*conflicted = append(*conflicted, name)
+	}
+}
+
+// mergeRoomPtr 同 mergeRoomValue，用于房间级覆盖里的指针字段。
+func mergeRoomPtr[T any](name string, dst **T, src *T, adopted, conflicted *[]string) {
+	switch {
+	case *dst == nil && src != nil:
+		*dst = src
+		*adopted = append(*adopted, name)
+	case *dst != nil && src != nil && *dst != src:
+		*conflicted = append(*conflicted, name)
+	}
+}
+
+func joinOrNone(names []string) string {
+	if len(names) == 0 {
+		return "无"
+	}
+	return strings.Join(names, ",")
 }
 
 // configMinimal 是配置文件的最小子集，仅包含 launcher 决策所需的字段。
@@ -1198,6 +1334,10 @@ func (c Config) getLiveRoomByUrlImpl(url string) (*LiveRoom, error) {
 
 func NewConfigWithBytes(b []byte) (*Config, error) {
 	config := defaultConfig
+	// defaultConfig 是包级变量，按值拷贝后 liveRoomIndexCache 仍指向同一张 map：
+	// 不换新 map 的话，下面 RefreshLiveRoomIndexCache 会直接改写全局默认配置的缓存，
+	// 让所有配置实例共享一张被并发读写的 map。
+	config.liveRoomIndexCache = map[string]int{}
 	if err := yaml.Unmarshal(b, &config); err != nil {
 		return nil, err
 	}
@@ -1266,7 +1406,69 @@ func (c *Config) Marshal() error {
 		return err
 	}
 
-	return os.WriteFile(c.File, buf.Bytes(), 0644)
+	// 配置文件里必然存着各平台登录 cookie 与斗鱼长期票据：先写同目录临时文件再 rename 替换。
+	// 直接 os.WriteFile 覆盖时，进程中途被杀或磁盘写满会在 config.yml 上留下半截 YAML，
+	// 下次启动连房间和登录态都读不出来；0600 也只有在新建时生效，故显式 Chmod。
+	return c.writeFileAtomically(buf.Bytes())
+}
+
+// writeFileAtomically 把 data 以仅属主可读写的方式写入 c.File：优先原子替换，
+// 只有在"原子替换这个动作本身不可用"时才回退为原地写。
+//
+// 必须有回退：Docker 用 -v ./config.yml:/app/config.yml 单文件挂载（K8s ConfigMap 的
+// subPath 同理）时，挂载点是跨设备的固定 inode，temp+rename 会 EXDEV/EBUSY 失败；
+// 而 Marshal 在启动路径上（NewConfigWithFile 会补写缺失字段），失败即 os.Exit(1)，
+// 等于让原本能正常跑的部署方式直接起不来。原地写就是本功能之前的行为，不会更差。
+//
+// 但只有 rename/建临时文件失败才允许回退：若数据写到一半就失败（典型是磁盘满），
+// 原地写会先把 config.yml 截断成 0 字节再失败，留下一份读不出来的配置。
+func (c *Config) writeFileAtomically(data []byte) error {
+	dir := filepath.Dir(c.File)
+	tmp, err := os.CreateTemp(dir, ".bililive-config-*.tmp")
+	if err != nil {
+		return c.writeInPlace(data)
+	}
+	tmpName := tmp.Name()
+	if err := writeAndSync(tmp, data); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	// 权限要在改名前设：新文件默认带 0600，但 umask/已存在的临时文件都可能让它更宽
+	if err := os.Chmod(tmpName, 0600); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, c.File); err != nil {
+		os.Remove(tmpName)
+		return c.writeInPlace(data)
+	}
+	return nil
+}
+
+// writeAndSync 写入并落盘后关闭（rename 只保证目录项原子替换，数据本身仍需 sync）
+func writeAndSync(f *os.File, data []byte) error {
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// writeInPlace 原地覆盖写入 c.File，同样保证 0600 与落盘
+func (c *Config) writeInPlace(data []byte) error {
+	f, err := os.OpenFile(c.File, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	if err := writeAndSync(f, data); err != nil {
+		return err
+	}
+	// 已存在的文件不会被 OpenFile 的 perm 改动权限，需显式收紧
+	return os.Chmod(c.File, 0600)
 }
 
 func (c Config) GetFilePath() (string, error) {
@@ -1314,6 +1516,85 @@ func CloneConfigShallow(src *Config) *Config {
 		cp.liveRoomIndexCache = map[string]int{}
 	}
 	return &cp
+}
+
+// LogSecretMask 是调试日志中代替凭证原文的占位符
+const LogSecretMask = "__BILILIVE_SECRET_HIDDEN__"
+
+// CloneForLog 返回 cfg 的副本，其中所有凭证类字段被替换为占位符，仅用于日志输出。
+// 启动时的 debug 配置转储会把整个 Config 以 %+v 写入日志文件，而日志经常随问题反馈一起上传，
+// 因此站点的 cookie（含斗鱼 acf_auth）、LTP0 长期票据、通知服务的 token/密码都不能原样落盘。
+// 只替换"值"，键与是否配置仍然可见，排障时仍能判断某项有没有配。
+func CloneForLog(cfg *Config) *Config {
+	if cfg == nil {
+		return nil
+	}
+	cp := CloneConfigShallow(cfg)
+	for host := range cp.Cookies {
+		cp.Cookies[host] = LogSecretMask
+	}
+	if cp.DouyuAuth.LTP0 != "" {
+		cp.DouyuAuth.LTP0 = LogSecretMask
+	}
+	if cp.DouyuAuth.DyDid != "" {
+		cp.DouyuAuth.DyDid = LogSecretMask
+	}
+	if cp.SoopLiveAuth.Password != "" {
+		cp.SoopLiveAuth.Password = LogSecretMask
+	}
+	if cp.Notify.Telegram.BotToken != "" {
+		cp.Notify.Telegram.BotToken = LogSecretMask
+	}
+	if cp.Notify.Email.SenderPassword != "" {
+		cp.Notify.Email.SenderPassword = LogSecretMask
+	}
+	if cp.Notify.Ntfy.Token != "" {
+		cp.Notify.Ntfy.Token = LogSecretMask
+	}
+	if cp.Notify.Bark.DeviceKey != "" {
+		cp.Notify.Bark.DeviceKey = LogSecretMask
+	}
+	if cp.Notify.WxPusher.AppToken != "" {
+		cp.Notify.WxPusher.AppToken = LogSecretMask
+	}
+	if cp.OpenList.Password != "" {
+		cp.OpenList.Password = LogSecretMask
+	}
+	if cp.OpenList.Token != "" {
+		cp.OpenList.Token = LogSecretMask
+	}
+	// 代理 URL 常内嵌账号密码（http://user:pass@host），同样按凭证处理
+	cp.Proxy.URL = maskProxyURL(cp.Proxy.URL)
+	cp.Proxy.InfoProxy = maskProxyEntryForLog(cp.Proxy.InfoProxy)
+	cp.Proxy.DownloadProxy = maskProxyEntryForLog(cp.Proxy.DownloadProxy)
+	return cp
+}
+
+func maskProxyEntryForLog(entry *ProxyEntry) *ProxyEntry {
+	if entry == nil || entry.URL == "" {
+		return entry
+	}
+	// 必须换新对象：CloneConfigShallow 是浅拷贝，改写指针会污染当前配置
+	cp := *entry
+	cp.URL = maskProxyURL(entry.URL)
+	return &cp
+}
+
+// maskProxyURL 隐藏代理 URL 中的用户名密码，保留 scheme 与 host 以便确认代理是否配置正确
+func maskProxyURL(rawURL string) string {
+	if rawURL == "" {
+		return rawURL
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.User == nil {
+		return rawURL
+	}
+	if _, hasPwd := u.User.Password(); hasPwd {
+		u.User = url.UserPassword(u.User.Username(), LogSecretMask)
+	} else {
+		u.User = url.User(u.User.Username())
+	}
+	return u.String()
 }
 
 // ResolveConfigForRoom 为指定房间解析最终的配置值
@@ -1444,6 +1725,156 @@ func (r *ResolvedConfig) applyOverrides(override *OverridableConfig) {
 	if override.Danmaku != nil {
 		r.Danmaku = mergeDanmakuConfig(&r.Danmaku, override.Danmaku)
 	}
+}
+
+// roomUrlHostAliases 房间 URL 的 host 别名表：把移动端/备用入口域名统一为平台标准域名，
+// 使 cookies、平台层级配置、房间查找等所有按 host 索引的链路只需认一个 key。
+var roomUrlHostAliases = map[string]string{
+	"m.douyu.com": "www.douyu.com",
+	// 斗鱼只注册了 www 域名的 builder，裸域房间必须在入库前归一，否则 "not support this url"；
+	// 归一后 cookie host key 也与斗鱼登录/续期使用的 www.douyu.com 对齐。
+	"douyu.com": "www.douyu.com",
+}
+
+// NormalizeCookieHost 把 Cookies 的 host key 归一为平台标准域名（douyu.com / m.douyu.com → www.douyu.com），
+// 与房间 URL 共用同一张别名表，使"按 host 取 cookie"的链路只认一个 key。
+func NormalizeCookieHost(host string) string {
+	if std, ok := roomUrlHostAliases[host]; ok {
+		return std
+	}
+	return host
+}
+
+// normalizeCookieHostKeys 归一并合并 Cookies 的 host key。
+// 手工编辑配置时常写裸域或移动端域名，键不归一则房间按标准 host 查不到登录 cookie——
+// 既不报错也不显示在面板上，只是静默退回匿名录制（斗鱼约 5 分钟被切断一次）。
+// 先按 host 排序再写入：标准键的值优先于别名键（不被别名反向覆盖），且结果与 map 遍历顺序无关，
+// 否则每次加载都会把 config.yml 里的 cookie 条目重排一遍，产生无意义的配置 diff。
+func normalizeCookieHostKeys(cookies map[string]string) map[string]string {
+	if len(cookies) == 0 {
+		return cookies
+	}
+	hosts := make([]string, 0, len(cookies))
+	for host := range cookies {
+		hosts = append(hosts, host)
+	}
+	sort.Strings(hosts)
+	out := make(map[string]string, len(cookies))
+	// 第一遍：非别名键原样保留。标准键是权威来源，不能被指向它的别名覆盖。
+	for _, host := range hosts {
+		if _, isAlias := roomUrlHostAliases[host]; isAlias {
+			continue
+		}
+		out[host] = cookies[host]
+	}
+	// 第二遍：别名键只在标准键缺失或为空时补位。
+	// 若按字典序单趟写入，"douyu.com" 排在 "www.douyu.com" 之前，
+	// 一条空值的裸域条目会先占位、再把标准键的有效 cookie 挤掉，登录态反而被归一动作弄丢。
+	for _, host := range hosts {
+		std, isAlias := roomUrlHostAliases[host]
+		if !isAlias || strings.TrimSpace(out[std]) != "" {
+			continue
+		}
+		out[std] = cookies[host]
+	}
+	return out
+}
+
+// ParseCookieFields 把 "k1=v1; k2=v2" 形式的 cookie 串解析为字段 map。
+func ParseCookieFields(s string) map[string]string {
+	m := make(map[string]string)
+	for _, item := range strings.Split(s, ";") {
+		item = strings.TrimSpace(item)
+		if k, v, ok := strings.Cut(item, "="); ok && k != "" {
+			m[k] = v
+		}
+	}
+	return m
+}
+
+// MergeCookieFields 用新字段覆盖旧 cookie 串中的同名字段，保留其余字段。
+// 输出按字段名排序：map 遍历顺序随机，不排序会让每次续期都把 config.yml 里的 cookie 整行重排。
+func MergeCookieFields(old string, newFields map[string]string) string {
+	merged := ParseCookieFields(old)
+	for k, v := range newFields {
+		merged[k] = v
+	}
+	keys := make([]string, 0, len(merged))
+	for k := range merged {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, k+"="+merged[k])
+	}
+	return strings.Join(parts, "; ")
+}
+
+// DropCookieFields 从 cookie 串中剔除指定字段，其余字段保持原样输出（按名排序，避免配置 diff 抖动）。
+func DropCookieFields(cookie string, names ...string) string {
+	fields := ParseCookieFields(cookie)
+	for _, n := range names {
+		delete(fields, n)
+	}
+	if len(fields) == 0 {
+		return ""
+	}
+	return MergeCookieFields("", fields)
+}
+
+// stripCookieFields 从 Cookies 每一项的值中剔除指定字段（如数月有效期的长期票据 LTP0）。
+// 只重写真正命中该字段的条目：其余 cookie 串保持用户原样，避免被重排后产生无意义的配置 diff。
+func stripCookieFields(cookies map[string]string, names ...string) {
+	for host, value := range cookies {
+		fields := ParseCookieFields(value)
+		hit := false
+		for _, n := range names {
+			if _, ok := fields[n]; ok {
+				hit = true
+				break
+			}
+		}
+		if !hit {
+			continue
+		}
+		cookies[host] = DropCookieFields(value, names...)
+	}
+}
+
+// NormalizeLiveRoomUrl 将房间 URL 中命中的别名 host 替换为标准 host（如 m.douyu.com → www.douyu.com）。
+// 解析失败或 host 不在别名表时原样返回。
+func NormalizeLiveRoomUrl(urlStr string) string {
+	u, err := url.Parse(urlStr)
+	if err != nil {
+		return urlStr
+	}
+	if std, ok := roomUrlHostAliases[u.Host]; ok {
+		u.Host = std
+		return u.String()
+	}
+	// 抖音直播首页分享出的 query 形态链接（如 live.douyin.com/?live_web_rid=xxx）path 为空，
+	// btools 从 path 取房间号会拿不到 → 房间信息请求必然失败，规范化为长链 https://live.douyin.com/<web_rid>。
+	// 只信任 live_web_rid（账号级稳定 web_rid），不用 room_id（可能是固化场次的真实 roomId）。
+	if u.Host == "live.douyin.com" && strings.Trim(u.Path, "/") == "" {
+		if rid := u.Query().Get("live_web_rid"); isAllDigits(rid) {
+			return "https://live.douyin.com/" + rid
+		}
+	}
+	return urlStr
+}
+
+// isAllDigits 判断 s 是否非空且全部为 ASCII 数字。
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // PlatformKeyDouyin 抖音的平台键。抖音的直播间解析依赖本地 bililive-tools 服务，
