@@ -860,6 +860,22 @@ func main() {
 		defer close(shutdownComplete)
 		<-msgChan
 		logger.Info("Received shutdown signal, closing...")
+
+		// 需求4：冲刷所有待合并队列（小文件合并）—— 必须在 rootCancel() **之前**。
+		//
+		// 为什么放这里：合并等待窗口可能跨越"停播 → 再次开播"，而直播间停播时 recorder
+		// 就会被回收，所以合并队列必须是比 recorder 更长寿的进程级单例（绝不能在
+		// recorder.Close 里冲刷，否则窗口永远等不到第二次录制）。
+		//
+		// ⚠️ 顺序至关重要：Pipeline 的 context 派生自 rootCtx，入队走的是
+		// store.CreateTask(manager.ctx, ...)。如果先 rootCancel()，入队会立即返回
+		// "context canceled"，冲刷出来的后处理会 **100% 丢失**。
+		// 此前本步骤被放在 rootCancel() 之后 —— 那是个真实缺陷：注释声称"保证不丢后处理"，
+		// 实际是必定全丢，这也是"重启后大量 flv 未转码"的成因之一。
+		//
+		// 代价：FlushAll 是同步的，大文件合并可能拉长退出耗时；数据完整性优先。
+		recorders.FlushAllSegmentMergers()
+
 		// 取消根 context，这会导致所有派生的 context 被取消
 		// 包括：WrappedLive 的调度器、非监听直播间的初始化循环等
 		rootCancel()
@@ -867,16 +883,6 @@ func main() {
 		if cfg := configs.GetCurrentConfig(); cfg != nil && cfg.RPC.Enable {
 			inst.Server.Close(ctx)
 		}
-		// 需求4：冲刷所有待合并队列（小文件合并）。
-		//
-		// 为什么放在这里：合并等待窗口可能跨越"停播 → 再次开播"，
-		// 而直播间停播时 recorder 就会被回收，所以合并队列必须是比 recorder 更长寿的
-		// 进程级单例（绝不能在 recorder.Close 里冲刷，否则窗口永远等不到第二次录制）。
-		// 放在 RecorderManager/PipelineManager 关闭之前，保证窗口内已录制的片段
-		// 仍能走完"合并 → 后处理（转码）"，不会因进程退出而永久停留在未转码状态。
-		//
-		// 代价：这是同步操作，大文件合并可能让退出耗时增加；但数据完整性优先。
-		recorders.FlushAllSegmentMergers()
 		// 关闭管理器
 		inst.ListenerManager.Close(ctx)
 		inst.RecorderManager.Close(ctx)

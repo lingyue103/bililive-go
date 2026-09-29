@@ -724,6 +724,62 @@ func stopListening(ctx context.Context, liveId types.LiveID) error {
 	return inst.ListenerManager.(listeners.Manager).RemoveListener(ctx, liveId)
 }
 
+// autoStartRecordingIfLive 若该直播间当前正在直播且尚未开始录制，则补建录制器并广播录制开始事件。
+//
+// 用于"房间从不可录制状态（仅提醒 / 一次性录制待删除）恢复为可录制"之后立即补录：
+// 不补的话用户操作完仍要等下一次开播才会真正开始录制。
+// 单房间编辑与批量转持久共用本函数，保证两处判定完全一致；reason 只用于日志。
+func autoStartRecordingIfLive(inst *instance.Instance, liveObj live.Live, reason string) bool {
+	if inst == nil || liveObj == nil {
+		return false
+	}
+	obj, err := inst.Cache.Get(liveObj)
+	if err != nil || obj == nil {
+		return false
+	}
+	liveInfo, ok := obj.(*live.Info)
+	if !ok || !liveInfo.Status {
+		// 未在直播或信息尚未就绪
+		return false
+	}
+	recorderMgr, ok := inst.RecorderManager.(recorders.Manager)
+	if !ok || recorderMgr.HasRecorder(inst.Ctx, liveObj.GetLiveId()) {
+		return false
+	}
+	if err := recorderMgr.AddRecorder(inst.Ctx, liveObj); err != nil {
+		liveObj.GetLogger().Errorf("自动开始录制失败: %v", err)
+		return false
+	}
+	liveObj.GetLogger().Infof("%s，自动开始录制", reason)
+	GetSSEHub().BroadcastListChange(liveObj.GetLiveId(), "record_start", map[string]interface{}{
+		"live_id": string(liveObj.GetLiveId()),
+	})
+	return true
+}
+
+// invalidConfigError 表示"用户提交的配置内容不合法"（参数级错误）。
+// 各配置写入点用它把"应当返回 400 的参数错误"与"应当返回 500 的服务端错误"区分开：
+// 校验失败的配置一律不落盘，且必须让调用方知道问题出在用户输入上。
+type invalidConfigError struct {
+	msg string
+}
+
+func (e *invalidConfigError) Error() string { return e.msg }
+
+// newInvalidConfigError 构造参数级配置错误，支持 fmt 风格格式化。
+func newInvalidConfigError(format string, args ...interface{}) error {
+	if len(args) == 0 {
+		return &invalidConfigError{msg: format}
+	}
+	return &invalidConfigError{msg: fmt.Sprintf(format, args...)}
+}
+
+// isInvalidConfigError 判断错误是否为参数级配置错误（用于选择 HTTP 400）。
+func isInvalidConfigError(err error) bool {
+	var target *invalidConfigError
+	return errors.As(err, &target)
+}
+
 /*
 	Post data example
 
@@ -1226,14 +1282,30 @@ func putRawConfig(writer http.ResponseWriter, r *http.Request) {
 	// 实测：4000 条 cookies 的明文提交耗时约 60ms，窗口内的斗鱼续期结果 100% 被抹掉。
 	// 因此所有继承/作废判定都必须以提交时刻的最新配置为基准在闭包内重算一遍（三方合并）。
 	var prevConfig *configs.Config
+	var verifyErr error
 	committed, err := configs.UpdateWithRetry(func(c *configs.Config) error {
 		// c 是最新配置的私有克隆：先另存一份提交前状态，供运行态房间差异比对使用
 		prevConfig = configs.CloneConfigShallow(c)
 		prevConfig.RefreshLiveRoomIndexCache()
 		applyRawConfigDoc(c, snapshot, newConfig, authSectionEdited, cookiesSectionEdited)
+		// 【D5】提交前补一次完整配置校验（与启动、PATCH /api/config 同一套规则）：
+		// 明文页是"整份配置"的编辑入口，非法时间 / 悬空模板名 / 一次性录制阈值为 0 一旦落盘，
+		// 下次启动 Verify 失败就会 os.Exit(1)，容器反复重启。校验失败直接中止提交（不落盘、不换内存快照）。
+		if verr := c.Verify(); verr != nil {
+			verifyErr = verr
+			return verr
+		}
 		return nil
 	}, 3, 10*time.Millisecond)
 	if err != nil {
+		// 校验失败属于用户提交的配置内容不合法 → 400；其余（落盘失败等）仍是 500
+		if verifyErr != nil {
+			writeJsonWithStatusCode(writer, http.StatusBadRequest, commonResp{
+				ErrNo:  http.StatusBadRequest,
+				ErrMsg: "配置校验失败: " + verifyErr.Error(),
+			})
+			return
+		}
 		writeJsonWithStatusCode(writer, http.StatusInternalServerError, commonResp{
 			ErrNo:  http.StatusInternalServerError,
 			ErrMsg: err.Error(),
@@ -1310,9 +1382,45 @@ func applyRawConfigDoc(latest, snapshot, doc *configs.Config, authSectionEdited,
 	for _, room := range latest.LiveRooms {
 		oldMap[room.Url] = room
 	}
+	// snapshot 是用户打开明文页时所见的配置，用于逐房间判断"这些机器字段用户改没改"
+	snapMap := make(map[string]configs.LiveRoom, len(snapshot.LiveRooms))
+	for _, room := range snapshot.LiveRooms {
+		snapMap[room.Url] = room
+	}
 	for i := range merged.LiveRooms {
-		if rOld, ok := oldMap[merged.LiveRooms[i].Url]; ok {
-			merged.LiveRooms[i].LiveId = rOld.LiveId
+		mr := &merged.LiveRooms[i]
+		rOld, ok := oldMap[mr.Url]
+		if !ok {
+			continue
+		}
+		mr.LiveId = rOld.LiveId
+
+		// 【D17】AddedAt 与一次性录制状态（OneTime*）都是"机器字段"：AddedAt 由添加链接 /
+		// 文件夹统计兜底回填，OneTime* 由后台 OneTimeManager 自动改写（停播超时把房间标成
+		// pending_delete、挽留后重新计时）。用户打开明文页期间这些字段可能已被改写，而文档里
+		// 带回的是打开页面那一刻的旧值——不合并的话，一次普通保存就把后台刚写进去的状态回滚
+		// （例如"待删除"被打回"录制中"，删除计时永远不推进）。
+		//
+		// 规则与 DouyuAuth / cookies 一致的三方合并：用户没动过（文档值 == 快照值）就取 latest，
+		// 动过则以用户这次编辑为准。快照里没有该房间（提交期间新增）时无从判断，按"未改动"处理。
+		rSnap, inSnap := snapMap[mr.Url]
+		oneTimeDocUnchanged := !inSnap || (mr.IsOneTime == rSnap.IsOneTime &&
+			mr.OneTimeStatus == rSnap.OneTimeStatus &&
+			mr.OneTimeLastLiveEnd == rSnap.OneTimeLastLiveEnd &&
+			mr.OneTimePendingDeleteAt == rSnap.OneTimePendingDeleteAt &&
+			mr.OneTimePendingDeleteHours == rSnap.OneTimePendingDeleteHours &&
+			mr.OneTimeDeleteLinkDays == rSnap.OneTimeDeleteLinkDays)
+		if oneTimeDocUnchanged {
+			mr.IsOneTime = rOld.IsOneTime
+			mr.OneTimeStatus = rOld.OneTimeStatus
+			mr.OneTimeLastLiveEnd = rOld.OneTimeLastLiveEnd
+			mr.OneTimePendingDeleteAt = rOld.OneTimePendingDeleteAt
+			mr.OneTimePendingDeleteHours = rOld.OneTimePendingDeleteHours
+			mr.OneTimeDeleteLinkDays = rOld.OneTimeDeleteLinkDays
+		}
+		// AddedAt 是纯机器字段且只增不减：latest 有值就用 latest，没有才保留文档值
+		if rOld.AddedAt != 0 {
+			mr.AddedAt = rOld.AddedAt
 		}
 	}
 	// 手工编辑"设置明文"里的斗鱼 cookie，只有换了登录账号才算换掉了一份登录态：按 acf_uid 判断。
@@ -1864,6 +1972,14 @@ func updateConfig(writer http.ResponseWriter, r *http.Request) {
 	}, 3, 10*time.Millisecond)
 
 	if err != nil {
+		// 【D5】参数级校验失败（一次性录制阈值等）返回 400，配置未落盘
+		if isInvalidConfigError(err) {
+			writeJsonWithStatusCode(writer, http.StatusBadRequest, commonResp{
+				ErrNo:  http.StatusBadRequest,
+				ErrMsg: err.Error(),
+			})
+			return
+		}
 		writeJsonWithStatusCode(writer, http.StatusInternalServerError, commonResp{
 			ErrNo:  http.StatusInternalServerError,
 			ErrMsg: "更新配置失败: " + err.Error(),
@@ -1931,10 +2047,18 @@ func applyConfigUpdates(c *configs.Config, updates map[string]interface{}) error
 		if v, ok := oneTime["default_one_time"].(bool); ok {
 			c.OneTimeRecord.DefaultOneTime = v
 		}
+		// 【D5】全局阈值必须为正：0 / 负数会写坏配置，下次启动 Config.Verify 直接失败并 os.Exit(1)。
+		// 这里提前判定为参数错误（400）而不是等 Verify 给出 500，且绝不会落盘。
 		if v, ok := oneTime["pending_delete_hours"].(float64); ok {
+			if int(v) <= 0 {
+				return newInvalidConfigError("一次性录制的「未开播阈值」必须大于 0 小时")
+			}
 			c.OneTimeRecord.PendingDeleteHours = int(v)
 		}
 		if v, ok := oneTime["delete_link_days"].(float64); ok {
+			if int(v) <= 0 {
+				return newInvalidConfigError("一次性录制的「删除链接延迟」必须大于 0 天")
+			}
 			c.OneTimeRecord.DeleteLinkDays = int(v)
 		}
 	}
@@ -2466,6 +2590,28 @@ func updateRoomConfigById(writer http.ResponseWriter, r *http.Request) {
 
 		room := &c.LiveRooms[roomIdx]
 
+		// 【D5】先校验、后写入：录制时间段与一次性录制覆盖值都必须合法才允许落盘。
+		// 不校验就写的话，非法时间 / 悬空模板名要让下次启动 Config.Verify 失败（os.Exit(1)，
+		// 容器反复重启）；模板名不存在还会让 ResolveRecordSlots 返回 nil，静默变成全天可录。
+		var newSchedule *configs.RecordSchedule
+		if rsVal, exists := updates["record_schedule"]; exists {
+			parsed, derr := decodeJSONField[configs.RecordSchedule](rsVal)
+			if derr != nil {
+				return newInvalidConfigError("录制时间段配置格式错误: %v", derr)
+			}
+			if verr := validateRoomRecordSchedule(c, room.Url, parsed); verr != nil {
+				return newInvalidConfigError("%v", verr)
+			}
+			newSchedule = &parsed
+		}
+		// 房间级覆盖值：0 表示沿用全局配置，负数非法（与 Config.Verify 同口径）
+		if v, ok := updates["one_time_pending_delete_hours"].(float64); ok && int(v) < 0 {
+			return newInvalidConfigError("直播间 %s 的「未开播阈值」不能为负数", room.Url)
+		}
+		if v, ok := updates["one_time_delete_link_days"].(float64); ok && int(v) < 0 {
+			return newInvalidConfigError("直播间 %s 的「删除链接延迟」不能为负数", room.Url)
+		}
+
 		// 保存更新前的 NotifyOnly 状态
 		wasNotifyOnly = room.NotifyOnly
 
@@ -2504,13 +2650,9 @@ func updateRoomConfigById(writer http.ResponseWriter, r *http.Request) {
 			configs.ResetOneTimeState(room)
 		}
 
-		// 【需求6】录制时间段配置
-		if rsVal, exists := updates["record_schedule"]; exists {
-			parsed, err := decodeJSONField[configs.RecordSchedule](rsVal)
-			if err != nil {
-				return fmt.Errorf("录制时间段配置格式错误: %w", err)
-			}
-			room.RecordSchedule = parsed
+		// 【需求6】录制时间段配置（合法性已在上方校验，这里只做赋值）
+		if newSchedule != nil {
+			room.RecordSchedule = *newSchedule
 		}
 
 		// 更新可覆盖配置
@@ -2528,6 +2670,14 @@ func updateRoomConfigById(writer http.ResponseWriter, r *http.Request) {
 	}, 3, 10*time.Millisecond)
 
 	if err != nil {
+		// 【D5】参数级校验失败（录制时间段 / 一次性录制覆盖值不合法）返回 400，且配置未落盘
+		if isInvalidConfigError(err) {
+			writeJsonWithStatusCode(writer, http.StatusBadRequest, commonResp{
+				ErrNo:  http.StatusBadRequest,
+				ErrMsg: err.Error(),
+			})
+			return
+		}
 		writeJsonWithStatusCode(writer, http.StatusInternalServerError, commonResp{
 			ErrNo:  http.StatusInternalServerError,
 			ErrMsg: "更新直播间配置失败: " + err.Error(),
@@ -2538,28 +2688,9 @@ func updateRoomConfigById(writer http.ResponseWriter, r *http.Request) {
 	// 如果从 NotifyOnly 切换为普通模式，检查是否正在直播并自动开始录制
 	if notifyOnly, ok := updates["notify_only"].(bool); ok {
 		if wasNotifyOnly && !notifyOnly {
-			// 检查是否正在直播（通过缓存）
-			liveObj, ok := inst.Lives.Get(types.LiveID(liveId))
-			if ok {
-				if obj, err := inst.Cache.Get(liveObj); err == nil && obj != nil {
-					liveInfo := obj.(*live.Info)
-					if liveInfo.Status {
-						// 正在直播，检查是否已经在录制
-						recorderMgr, ok := inst.RecorderManager.(recorders.Manager)
-						if ok && !recorderMgr.HasRecorder(inst.Ctx, liveObj.GetLiveId()) {
-							// 未在录制，自动开始录制
-							if err := recorderMgr.AddRecorder(inst.Ctx, liveObj); err != nil {
-								liveObj.GetLogger().Errorf("自动开始录制失败: %v", err)
-							} else {
-								liveObj.GetLogger().Info("从仅提醒模式切换为普通模式，自动开始录制")
-								// 广播录制开始事件
-								GetSSEHub().BroadcastListChange(liveObj.GetLiveId(), "record_start", map[string]interface{}{
-									"live_id": string(liveObj.GetLiveId()),
-								})
-							}
-						}
-					}
-				}
+			// 检查是否正在直播（通过缓存）；补录逻辑与批量"转为持久性"共用
+			if liveObj, ok := inst.Lives.Get(types.LiveID(liveId)); ok {
+				autoStartRecordingIfLive(inst, liveObj, "从仅提醒模式切换为普通模式")
 			}
 		}
 	}
@@ -2888,6 +3019,13 @@ func getFileInfo(writer http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		name := file.Name()
+		// 【D10】foldersize 写入的目录归属标识文件（.bililive-room-id，以及原子写残留的
+		// .bililive-room-id-*.tmp）是内部元数据：下发到文件列表后用户能删除/重命名它，
+		// 会导致录制目录失去归属（文件夹大小统计错乱）。这里直接过滤，前端根本看不到。
+		// 注意不能连带过滤其它点开头的文件（.ass 弹幕文件必须以 SubtitleFile 关联出去）。
+		if strings.HasPrefix(name, foldersize.RoomIDFileName) {
+			continue
+		}
 		if !file.IsDir() && strings.HasSuffix(strings.ToLower(name), ".ass") {
 			// Register ASS file by base name (without extension)
 			baseName := name[:len(name)-4]

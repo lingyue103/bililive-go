@@ -32,6 +32,15 @@ var btoolsClient = &http.Client{
 // doBToolsRequest 向本地 bililive-tools 服务发起一次带鉴权的 GET 请求。
 // 返回的 body 已经读取完毕并关闭，调用方直接解析即可。
 func doBToolsRequest(endpoint string) ([]byte, error) {
+	// 需求8（软重启）：抖音的取流信息全部来自本地 bililive-tools（127.0.0.1），
+	// 既不经过 BaseLive.RequestSession，也就不会被 pause.WrapTransport 掐断。
+	// 因此必须在这里单独判定闸门：暂停期间直接返回，连本地请求都不发出去。
+	// 上层（WrappedLive.GetInfo 的闸门）此时通常已经拦住，这里是兜底，
+	// 覆盖任何绕过包装器直接调用平台实现的情形。
+	if live.IsSoftRestartPaused() {
+		return nil, live.ErrSoftRestartPaused
+	}
+
 	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -173,6 +182,12 @@ func (l *btoolsLive) GetInfo() (info *live.Info, err error) {
 }
 
 func (l *btoolsLive) GetStreamInfos() (us []*live.StreamUrlInfo, err error) {
+	// 需求8（软重启）：取流地址同样要过闸门。WrappedLive 侧已经有一层，
+	// 这里再判一次是为了让「直接持有平台实现」的调用方也拦住，
+	// 并且避免先去做 updateChannelInfo 这类本地请求。
+	if live.IsSoftRestartPaused() {
+		return nil, live.ErrSoftRestartPaused
+	}
 	if l.roomId == "" {
 		err = l.updateChannelInfo()
 		if err != nil {

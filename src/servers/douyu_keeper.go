@@ -11,6 +11,7 @@ import (
 	dy "github.com/bililive-go/bililive-go/src/live/douyu"
 	applog "github.com/bililive-go/bililive-go/src/log"
 	"github.com/bililive-go/bililive-go/src/notify"
+	"github.com/bililive-go/bililive-go/src/pkg/pause"
 	bilisentry "github.com/bililive-go/bililive-go/src/pkg/sentry"
 )
 
@@ -69,6 +70,21 @@ func effectiveNextRefreshAt(cfg *configs.Config) int64 {
 // 换票链的串行性由调用方保证——只有 StartDouyuCookieKeeper 那一个 goroutine 会走到这里，
 // 且它同步等本次换票返回后才重排下一次检查，因此不存在两条链并发合并字段的可能。
 func refreshDouyuCookieIfDue(ctx context.Context) {
+	// 需求8（软重启）：暂停闸门期间不发起 safeAuth 换票。
+	//
+	// 这条链用的是 douyu 包自己的 douyuHTTPClient（独立 client，不经 BaseLive.RequestSession），
+	// pause.WrapTransport 覆盖不到；而且它是登录类接口，恰好撞进软重启窗口既无收益
+	// （断流期间本来就不需要新 cookie），又白担一次风控风险。
+	//
+	// 直接跳过本轮即可：调用方 StartDouyuCookieKeeper 的定时器会在本轮结束后照常重排下一次检查
+	// （默认 1 小时），闸门早已放开，下一轮会按盘上日程正常续期。
+	// 注意这里**不**推进 NextRefreshAt、也不记内存退避：暂停不是续期失败，
+	// 不能因为软重启就把续期日程往后推。
+	if pause.Default().IsPaused() {
+		applog.GetLogger().Info("软重启暂停中，跳过本轮斗鱼 cookie 自动续期（下次检查时再试）")
+		return
+	}
+
 	cfg := configs.GetCurrentConfig()
 	if cfg == nil || cfg.DouyuAuth.LTP0 == "" {
 		return
@@ -86,6 +102,13 @@ func doDouyuRefresh(ctx context.Context, cfg *configs.Config) {
 	ltp0Used := cfg.DouyuAuth.LTP0
 	fields, err := dy.RefreshLoginCookie(ctx, ltp0Used, cfg.DouyuAuth.DyDid)
 	if err != nil {
+		// 需求8（软重启）：兜住"闸门在换票途中才关上"的竞态 —— 这种错误不是续期失败，
+		// 绝不能走去重提醒/长退避：既不该打扰用户，也不该把续期日程往后推。
+		// 直接跳过本轮，下次检查时再按盘上日程正常续期。
+		if errors.Is(err, dy.ErrSoftRestartPaused) || pause.Default().IsPaused() {
+			applog.GetLogger().Info("软重启暂停中，跳过本轮斗鱼 cookie 自动续期（下次检查时再试）")
+			return
+		}
 		if errors.Is(err, dy.ErrLoginInvalid) {
 			handleRenewInvalid(ltp0Used, err)
 		} else {

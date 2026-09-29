@@ -2,6 +2,7 @@ package recorders
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,9 +13,19 @@ import (
 	"github.com/bililive-go/bililive-go/src/listeners"
 	"github.com/bililive-go/bililive-go/src/live"
 	"github.com/bililive-go/bililive-go/src/pkg/events"
+	"github.com/bililive-go/bililive-go/src/pkg/pause"
 	bilisentry "github.com/bililive-go/bililive-go/src/pkg/sentry"
 	"github.com/bililive-go/bililive-go/src/pkg/timeslot"
 	"github.com/bililive-go/bililive-go/src/types"
+)
+
+const (
+	// recordScheduleCheckInterval 录制时间段补录检查周期。
+	//
+	// LiveStart 回调只在开播那一刻判定一次录制时段，因此"开播在时段外、
+	// 之后才进入时段"的直播会整场漏录。这里以低频（约每分钟一次）补一次
+	// 与 LiveStart 完全相同的判定，避免整场丢失；不需要更密。
+	recordScheduleCheckInterval = time.Minute
 )
 
 // BroadcastRecorderStatusFunc 是用于广播录制器状态的回调函数类型
@@ -90,6 +101,8 @@ type manager struct {
 	statusStopCh chan struct{}
 	statusWg     sync.WaitGroup // 用于等待广播 goroutine 退出
 	notifyWg     sync.WaitGroup // 跟踪异步通知 goroutine（sendAccumulatedSummary），关闭时等待
+	// recordCheckTicker 录制时段补录检查的 ticker（与状态广播共用同一个 goroutine 生命周期）
+	recordCheckTicker *time.Ticker
 	// restartingCount 追踪正在执行 CloseForRestart 的旧 recorder 数量。
 	// RestartRecorder 在释放锁后才执行 oldRecorder.CloseForRestart()，
 	// 此期间 map 中只有新 recorder，但旧 recorder 仍在收尾运行。
@@ -176,6 +189,9 @@ func (m *manager) Close(ctx context.Context) {
 	// 停止状态广播器
 	if m.statusTicker != nil {
 		m.statusTicker.Stop()
+	}
+	if m.recordCheckTicker != nil {
+		m.recordCheckTicker.Stop()
 	}
 	if m.statusStopCh != nil {
 		close(m.statusStopCh)
@@ -365,10 +381,30 @@ func (m *manager) HasRecorder(ctx context.Context, liveId types.LiveID) bool {
 	return ok
 }
 
+// RecordingLiveIDs 返回当前存在录制器的直播间 ID 列表（只读快照，一次加锁读全量）。
+//
+// 供软重启在"停止所有录制器之前"快照需要在恢复阶段无条件补录的房间：
+// 已经开始的录制不应因为软重启（或期间到达录制时段的结束时刻）而丢失。
+//
+// 注意：刻意不加入导出的 Manager 接口 —— 该接口已有生成的 mock
+// （src/recorders/mock_test.go），加方法会让 mock 不再满足接口而编译失败。
+// 调用方用本地小接口做类型断言即可（见 pkg/softrestart）。
+func (m *manager) RecordingLiveIDs() []string {
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+	ids := make([]string, 0, len(m.savers))
+	for id := range m.savers {
+		ids = append(ids, string(id))
+	}
+	return ids
+}
+
 // startStatusBroadcaster 启动定期广播录制器状态的 goroutine
 func (m *manager) startStatusBroadcaster(ctx context.Context) {
 	// 每5秒广播一次录制器状态
 	m.statusTicker = time.NewTicker(5 * time.Second)
+	// 录制时段补录检查：低频（约每分钟）跑一次
+	m.recordCheckTicker = time.NewTicker(recordScheduleCheckInterval)
 
 	m.statusWg.Add(1)
 	bilisentry.Go(func() {
@@ -381,9 +417,80 @@ func (m *manager) startStatusBroadcaster(ctx context.Context) {
 				return
 			case <-m.statusTicker.C:
 				m.broadcastAllRecorderStatus(ctx)
+			case <-m.recordCheckTicker.C:
+				m.recordScheduleCatchUp(ctx)
 			}
 		}
 	})
+}
+
+// recordScheduleCatchUp 为"开播时不在录制时段、之后才进入时段"的直播间补建录制器。
+//
+// LiveStart 回调（registryListener）只在开播那一刻判定一次时段，这类直播会整场漏录。
+// 这里的判定条件与 registryListener 完全一致，并且只对"当前没有录制器"的房间生效，
+// 真正的重复保护仍由 addRecorderLocked 在锁内完成（返回 ErrRecorderExist）。
+func (m *manager) recordScheduleCatchUp(ctx context.Context) {
+	cfg := configs.GetCurrentConfig()
+	if cfg == nil {
+		return
+	}
+	inst := instance.GetInstance(ctx)
+	if inst == nil {
+		return
+	}
+	// 软重启切断流量期间不新建录制器：恢复阶段会统一补录，
+	// 此刻建出来的录制器也发不出任何请求，只会徒增状态抖动。
+	if pause.Default().IsPaused() {
+		return
+	}
+
+	now := time.Now()
+	for id, l := range inst.Lives.Snapshot() {
+		if l == nil {
+			continue
+		}
+		if m.HasRecorder(ctx, id) {
+			continue
+		}
+		room, err := cfg.GetLiveRoomByUrl(l.GetRawUrl())
+		if err != nil || room == nil {
+			continue
+		}
+		// 与 registryListener 相同的跳过条件（IsListening 额外兜一道：
+		// 已停止监控的房间不应被周期性补录重新拉起）
+		if !room.IsListening || room.NotifyOnly || room.IsPendingDelete() {
+			continue
+		}
+		// 只处理"配置了录制时段"的房间：未配时段的房间在开播时已经建过录制器，
+		// 此处再判只会重复劳动（真正漏录的场景一定是时段判定导致的）。
+		slots := room.ResolveRecordSlots(cfg.RecordScheduleTemplates)
+		if len(slots) == 0 {
+			continue
+		}
+		if !timeslot.IsActive(timeslot.Compile(slots), now) {
+			continue
+		}
+		// 必须确实处于直播中（与软重启补录一样读监听缓存，不发起任何请求）
+		if inst.Cache == nil {
+			continue
+		}
+		obj, cerr := inst.Cache.Get(l)
+		if cerr != nil || obj == nil {
+			continue
+		}
+		info, ok := obj.(*live.Info)
+		if !ok || !info.Status {
+			continue
+		}
+		if err := m.AddRecorder(ctx, l); err != nil {
+			// 并发下已被 LiveStart 建好录制器属于正常情况，不必刷错误日志
+			if !errors.Is(err, ErrRecorderExist) {
+				l.GetLogger().Warnf("进入录制时间段后补建录制器失败: %v", err)
+			}
+			continue
+		}
+		l.GetLogger().Info("已进入配置的录制时间段，补建录制器开始录制")
+	}
 }
 
 // broadcastAllRecorderStatus 广播所有录制器的状态

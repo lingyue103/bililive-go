@@ -30,11 +30,17 @@ func TestRPC_Verify(t *testing.T) {
 func TestConfig_Verify(t *testing.T) {
 	var cfg *Config
 	assert.Error(t, cfg.Verify())
+	// 需求1/需求8 新增了全局配置校验（一次性录制阈值、软重启恢复时长），
+	// 这些字段的合法默认值定义在 defaultConfig 里；手工构造 Config 时必须一并带上，
+	// 否则 Verify 会因为"阈值为 0"而报错——这与真实加载路径一致
+	// （NewConfigWithBytes 从 defaultConfig 起步再叠加 YAML，缺失字段会保留默认值）。
 	cfg = &Config{
-		RPC:        defaultRPC,
-		Interval:   30,
-		OutPutPath: os.TempDir(),
-		Danmaku:    defaultDanmakuConfig,
+		RPC:           defaultRPC,
+		Interval:      30,
+		OutPutPath:    os.TempDir(),
+		Danmaku:       defaultDanmakuConfig,
+		OneTimeRecord: defaultConfig.OneTimeRecord,
+		AutoRestart:   defaultConfig.AutoRestart,
 	}
 	assert.NoError(t, cfg.Verify())
 	cfg.Interval = 0

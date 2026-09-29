@@ -24,36 +24,67 @@ type RecordingFileDetail struct {
 // SendNotification 发送统一通知函数
 // 检测用户是否开启了telegram和email通知服务，然后分别发送通知
 // 参数: logger(LiveLogger), hostName(主播姓名), platform(直播平台), liveURL(直播地址), status(直播状态: consts.LiveStatusStart/consts.LiveStatusStop), notifyOnly(是否为仅提醒模式)
+//
+// 保持原有签名不变：不传 notifyOnly 时行为与历史版本完全一致。
+// 需要区分"当前不会录制并说明原因"时请使用 SendNotificationEx。
 func SendNotification(logger *livelogger.LiveLogger, hostName, platform, liveURL, status string, notifyOnly ...bool) error {
+	// 判断是否为仅提醒模式
+	isNotifyOnly := false
+	if len(notifyOnly) > 0 {
+		isNotifyOnly = notifyOnly[0]
+	}
+	return SendNotificationEx(logger, hostName, platform, liveURL, status, isNotifyOnly, "")
+}
+
+// SendNotificationEx 发送统一通知（可携带"当前不录制的原因"）。
+//
+// 开播通知实际有三种状态，文案必须能区分，否则会出现"通知说在录制、实际没录"的矛盾：
+//  1. 真在录制 —— notifyOnly=false 且 skipReason 为空；
+//  2. 仅提醒（notify_only 房间）—— notifyOnly=true；
+//  3. 开播了但当前不会录制 —— skipReason 非空，例如"当前不在录制时间段"
+//     或"一次性录制已进入待删除"，此时文案会写明原因。
+//
+// 参数与 SendNotification 的差异仅有末尾新增的 skipReason；传空串即与旧行为一致。
+func SendNotificationEx(
+	logger *livelogger.LiveLogger,
+	hostName, platform, liveURL, status string,
+	notifyOnly bool,
+	skipReason string,
+) error {
 	// 获取当前配置
 	cfg := configs.GetCurrentConfig()
 	if cfg == nil {
 		return fmt.Errorf("configuration is nil")
 	}
 
-	// 判断是否为仅提醒模式
-	isNotifyOnly := false
-	if len(notifyOnly) > 0 {
-		isNotifyOnly = notifyOnly[0]
-	}
-
 	// 根据状态和模式设置消息内容
 	var messageStatus string
 	switch status {
 	case consts.LiveStatusStart:
-		if isNotifyOnly {
+		switch {
+		case notifyOnly:
 			messageStatus = "已开播，请手动开始录制"
-		} else {
+		case skipReason != "":
+			messageStatus = fmt.Sprintf("已开播，但当前不会录制（%s），仅提醒", skipReason)
+		default:
 			messageStatus = "已开始直播,正在录制中"
 		}
 	case consts.LiveStatusStop:
-		if isNotifyOnly {
+		if notifyOnly {
 			messageStatus = "已结束直播"
 		} else {
 			messageStatus = "已结束直播,录制已停止"
 		}
 	default:
 		messageStatus = "直播状态未知"
+	}
+
+	// ntfy / bark 只支持"是否仅提醒"两种文案（签名不在本次改动范围内），
+	// 因此"当前不会录制"按"仅提醒"下发 —— 至少不会再误报"正在录制中"。
+	// 结束状态与 skipReason 无关，保持原样。
+	notifyOnlyForChannel := notifyOnly
+	if status == consts.LiveStatusStart && skipReason != "" {
+		notifyOnlyForChannel = true
 	}
 
 	// 统一主播信息格式
@@ -112,7 +143,7 @@ func SendNotification(logger *livelogger.LiveLogger, hostName, platform, liveURL
 				platform,
 				liveURL,
 				schemeUrl,
-				isNotifyOnly,
+				notifyOnlyForChannel,
 			)
 		case consts.LiveStatusStop:
 			// 发送Ntfy停止录制通知
@@ -123,7 +154,7 @@ func SendNotification(logger *livelogger.LiveLogger, hostName, platform, liveURL
 				hostName,
 				platform,
 				liveURL,
-				isNotifyOnly,
+				notifyOnlyForChannel,
 			)
 		}
 
@@ -147,7 +178,7 @@ func SendNotification(logger *livelogger.LiveLogger, hostName, platform, liveURL
 				hostName,
 				platform,
 				liveURL,
-				isNotifyOnly,
+				notifyOnlyForChannel,
 			)
 		case consts.LiveStatusStop:
 			err = bark.SendStopMessage(
@@ -160,7 +191,7 @@ func SendNotification(logger *livelogger.LiveLogger, hostName, platform, liveURL
 				hostName,
 				platform,
 				liveURL,
-				isNotifyOnly,
+				notifyOnlyForChannel,
 			)
 		}
 		if err != nil {

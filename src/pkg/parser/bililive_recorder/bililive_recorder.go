@@ -176,14 +176,19 @@ func (p *Parser) ParseLiveStream(ctx context.Context, streamUrlInfo *live.Stream
 	}
 
 	// 将输出重定向到日志
-	p.cmd.Stdout = io.MultiWriter(
+	// 两个流都套一层「存储不足」检测器：录播姬写盘失败时只会把原因打到控制台，
+	// 退出码/错误文本里看不出是磁盘满，上层无法据此启用退避（见 parser.ErrStorageFull）。
+	// 检测器与 p.cmd 一起在 cmdLock 内创建，生命周期与本次录制一致，不做跨录制复用。
+	stdoutDetector := parser.NewStorageFullDetectingWriter(io.MultiWriter(
 		utils.NewDebugControlledWriter(os.Stdout),
 		utils.NewLoggerWriter(p.logger),
-	)
-	p.cmd.Stderr = io.MultiWriter(
+	))
+	stderrDetector := parser.NewStorageFullDetectingWriter(io.MultiWriter(
 		utils.NewLogFilterWriter(os.Stderr),
 		utils.NewLoggerWriter(p.logger),
-	)
+	))
+	p.cmd.Stdout = stdoutDetector
+	p.cmd.Stderr = stderrDetector
 
 	if cmdErr = p.cmd.Start(); cmdErr != nil {
 		if p.cmd.Process != nil {
@@ -200,15 +205,24 @@ func (p *Parser) ParseLiveStream(ctx context.Context, streamUrlInfo *live.Stream
 		cmdDone <- p.cmd.Wait()
 	})
 
+	// storageFull 判定本次录制期间是否出现过「存储不足」文本（stdout/stderr 任一即可）。
+	// 必须在 Wait() 返回之后读取：os/exec 保证 Wait 返回前输出拷贝 goroutine 已结束。
+	storageFull := func() bool {
+		return stdoutDetector.IsStorageFull() || stderrDetector.IsStorageFull()
+	}
+
 	select {
 	case <-p.stopCh:
 		// 收到停止信号，发送 'q' 优雅停止
 		if p.cmdStdIn != nil {
 			p.cmdStdIn.Write([]byte("q\n"))
 		}
-		return <-cmdDone
+		waitErr := <-cmdDone
+		return parser.StorageFullError(waitErr, storageFull())
 	case err := <-cmdDone:
-		return err
+		// 磁盘写满时录播姬的退出信息里没有磁盘关键词，这里补上哨兵语义，
+		// 让 recorders.isDiskWriteFailure 能识别（仅 err != nil 时才包装）。
+		return parser.StorageFullError(err, storageFull())
 	}
 }
 

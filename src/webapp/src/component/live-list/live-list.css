@@ -18,3 +18,901 @@
         text-overflow: ellipsis;
     }
 }
+
+/* ============================================================================
+ * 窄屏（≤768px）卡片式列表样式
+ *
+ * 命名约定：.ll-* 只在本区块内定义，全部包在窄屏媒体查询里，桌面端零影响。
+ *
+ * 移动端设计目标：
+ *   1) 绝不出现横向滚动（长 URL / 长主播名 / 长标题一律换行或省略号截断）；
+ *   2) 只有一层纵向滚动（.ll-mobile-list 是窄屏页面里唯一的滚动容器）；
+ *   3) 触控目标 ≥ 44px、字号 ≥ 13px；
+ *   4) 每张卡片首屏即可看清「操作对象是谁」（主播名 + 直播间名 + 平台 + 状态标签）。
+ *
+ * 为什么用 max-width 与 max-device-width 双条件逐个覆盖：
+ *   max-width 按视口宽度（桌面浏览器拖窄、横竖屏切换都能命中，且组件里的
+ *   matchMedia(MOBILE_MEDIA_QUERY) 判断的就是它，两者口径一致，不会出现
+ *   「React 已按窄屏渲染、CSS 还停留在桌面版」的错位）；
+ *   max-device-width 兼容不支持视口媒体查询的老设备（如旧 iOS Safari）。
+ *   两条规则的样式完全相同，命中哪一条都不会产生差异。
+ * ========================================================================== */
+
+@media (max-width: 768px) {
+    /* ---- 为「一层纵向滚动」做布局准备：内容区改为占满高度的 flex 容器 ---- */
+    .content-padding {
+        padding: 0 !important;
+        display: flex;
+        flex-direction: column;
+        flex: 1;
+        min-height: 0;
+        /* 覆盖 layout.tsx 里 Content 的行内 overflow:auto —— 窄屏不再由它滚动 */
+        overflow: hidden !important;
+    }
+    .inside-content-padding {
+        padding: 0 !important;
+        display: flex;
+        flex-direction: column;
+        flex: 1;
+        min-height: 0;
+        overflow: hidden !important;
+    }
+
+    /* ---- 卡片列表外壳：占满可用高度 ---- */
+    /* 这里刻意不用 100vh / 100dvh 写死高度：
+       窄屏界面里 Tabs 标签栏（约 44px）+ 顶部工具条也占高度，写死视口高度会超出可视区、
+       把底部批量条推出屏幕。改为依赖「父级链已占满窗口高度 + overflow:hidden」，
+       让 .ll-mobile-shell 自动吃掉剩余高度：
+         html/body(100%) -> .all-layout(100%) -> 内层 Layout -> .content-padding(flex:1)
+         -> .inside-content-padding(flex:1) -> antd Tabs(flex:1)
+         -> Tabs 内容区(flex:1) -> .ll-mobile-shell(100%)
+       两端都用 overflow:hidden 夹住，因此不会出现第二层滚动。 */
+    .ll-mobile-shell {
+        display: flex;
+        flex-direction: column;
+        height: 100%;
+        min-height: 0;
+        max-height: 100%;
+        min-width: 0;
+        overflow: hidden;
+        background: #f5f5f5;
+        box-sizing: border-box;
+    }
+
+    /* ------------------------------------------------------------------
+     * 高度链打通（真机验证发现的缺陷修复）
+     *
+     * 背景：上面的 .ll-mobile-shell 用 height:100% 吃掉剩余高度，但这条链在真实 DOM 里
+     * 是断的 —— html/body/#root 都没有 height，App.css 的 .all-layout{height:100%} 因此
+     * 解析成 auto；再加上 antd Layout/Tabs 的中间层（.ant-layout / .ant-tabs /
+     * .ant-tabs-content-holder / .ant-tabs-tabpane）默认都是内容高度，
+     * 于是 .ll-mobile-shell 的 height:100% 也退化成 auto：结果是「整页滚动」，
+     * 底部批量条被顶到页面最下方、首屏根本看不见，同时形成「页面 + 列表」双层滚动。
+     *
+     * 这里把每一层都显式钉死为「占满剩余高度 + min-height:0 + overflow:hidden」，
+     * 让 .ll-mobile-list 成为唯一滚动容器。全部规则都用
+     *   .all-layout:has(.ll-mobile-shell)
+     * 限定，因此**只在窄屏的直播间列表页生效**：其它页面（文件列表、设置页等）
+     * 保持原来的整页滚动行为不受影响；桌面端（>768px）完全不进入本媒体查询。
+     * 浏览器不支持 :has() 时这些规则被整条忽略，退回改动前的行为（不至于更糟）。
+     * ------------------------------------------------------------------ */
+    .all-layout:has(.ll-mobile-shell) {
+        height: 100vh;   /* 老浏览器兜底 */
+        height: 100dvh;  /* 支持动态视口单位时用它，避免移动端地址栏收放导致高度错位 */
+        min-height: 0;
+        overflow: hidden;
+    }
+    .all-layout:has(.ll-mobile-shell) > .ant-layout {
+        flex: 1;
+        min-height: 0;
+    }
+    .all-layout:has(.ll-mobile-shell) > .header {
+        flex-shrink: 0;
+    }
+    /* 路由组件外面那层 <div>（live-list render() 的根节点）也要传递高度 */
+    .all-layout:has(.ll-mobile-shell) .inside-content-padding > div {
+        flex: 1;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+    }
+    /* antd Tabs 内部逐层传递高度，并去掉卡片式 Tabs 默认的 16px 下边距 */
+    .all-layout:has(.ll-mobile-shell) .inside-content-padding .ant-tabs {
+        flex: 1;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+    }
+    .all-layout:has(.ll-mobile-shell) .inside-content-padding .ant-tabs > .ant-tabs-nav {
+        flex-shrink: 0;
+        margin: 0;
+    }
+    .all-layout:has(.ll-mobile-shell) .inside-content-padding .ant-tabs > .ant-tabs-content-holder {
+        flex: 1;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+    }
+    .all-layout:has(.ll-mobile-shell) .inside-content-padding .ant-tabs .ant-tabs-content {
+        flex: 1;
+        min-height: 0;
+    }
+    .all-layout:has(.ll-mobile-shell) .inside-content-padding .ant-tabs .ant-tabs-tabpane {
+        height: 100%;
+        min-height: 0;
+        overflow: hidden;
+    }
+
+    /* ---- 顶部工具条（不随列表滚动） ---- */
+    .ll-mobile-topbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 8px 12px;
+        background: #fff;
+        border-bottom: 1px solid #f0f0f0;
+        flex-shrink: 0;
+    }
+    .ll-mobile-title {
+        font-size: 16px;
+        font-weight: 600;
+        color: rgba(0, 0, 0, 0.88);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        min-width: 0;
+    }
+    .ll-mobile-count {
+        font-size: 12px;
+        font-weight: 400;
+        color: #8c8c8c;
+        margin-left: 6px;
+    }
+    .ll-mobile-topbar-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-shrink: 0;
+    }
+    .ll-mobile-topbar-actions .ant-btn {
+        min-height: 36px;
+        font-size: 14px;
+    }
+
+    /* ---- 主区：固定工具条 + 唯一滚动层 ---- */
+    .ll-mobile-main {
+        display: flex;
+        flex-direction: column;
+        flex: 1;
+        min-height: 0;
+        min-width: 0;
+        overflow: hidden;
+    }
+    .ll-mobile-fixed {
+        flex-shrink: 0;
+    }
+    .ll-mobile-toolbar {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        padding: 8px 12px;
+        background: #fff;
+        border-bottom: 1px solid #f0f0f0;
+    }
+    .ll-mobile-toolbar-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-width: 0;
+    }
+    .ll-mobile-toolbar-row .ant-input-affix-wrapper,
+    .ll-mobile-toolbar-row .ant-input {
+        flex: 1;
+        min-width: 0;
+        min-height: 40px;
+        font-size: 14px;
+    }
+    .ll-mobile-toolbar-row.ll-mobile-toolbar-sub {
+        justify-content: space-between;
+    }
+    /* 工具条按钮：高度 40px（配合卡片/行的间距，触控区 ≥44px），字号 ≥13px */
+    .ll-mobile-tool-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 4px;
+        flex-shrink: 0;
+        min-height: 40px;
+        padding: 0 12px;
+        font-size: 13px;
+        line-height: 1;
+        color: rgba(0, 0, 0, 0.75);
+        background: #fff;
+        border: 1px solid #d9d9d9;
+        border-radius: 8px;
+        cursor: pointer;
+        white-space: nowrap;
+    }
+    .ll-mobile-tool-btn:active {
+        background: #f0f0f0;
+    }
+    .ll-mobile-tool-btn.active {
+        color: #1677ff;
+        border-color: #91caff;
+        background: #e6f4ff;
+    }
+    .ll-mobile-hint {
+        flex: 1;
+        min-width: 0;
+        font-size: 12px;
+        color: #8c8c8c;
+        text-align: right;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    /* ---- 唯一滚动层 ---- */
+    .ll-mobile-list {
+        flex: 1;
+        min-height: 0;
+        min-width: 0;
+        overflow-y: auto;
+        overflow-x: hidden;
+        -webkit-overflow-scrolling: touch;
+        padding: 10px 12px 16px;
+        box-sizing: border-box;
+    }
+    .ll-mobile-list > * {
+        max-width: 100%;
+    }
+    .ll-mobile-empty {
+        padding: 48px 0;
+        text-align: center;
+        color: #999;
+        font-size: 14px;
+    }
+    .ll-mobile-more {
+        min-height: 44px;
+        margin-top: 4px;
+        font-size: 14px;
+    }
+    .ll-mobile-footnote {
+        margin: 12px 0 4px;
+        font-size: 12px;
+        color: #bfbfbf;
+        text-align: center;
+    }
+
+    /* ---- 卡片 ---- */
+    .ll-card {
+        position: relative;
+        background: #fff;
+        border: 1px solid #ebedf0;
+        border-radius: 12px;
+        margin-bottom: 10px;
+        padding: 12px;
+        box-sizing: border-box;
+        max-width: 100%;
+        /* 关键：卡片内任何超宽内容都只在本卡片内被裁掉，绝不把页面撑出横向滚动 */
+        overflow: hidden;
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+        transition: box-shadow 0.2s, border-color 0.2s;
+    }
+    .ll-card-selected {
+        border-color: #1677ff;
+        box-shadow: 0 0 0 2px rgba(22, 119, 255, 0.12);
+    }
+    .ll-card-expanded {
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.1);
+    }
+    /* 待删除：左侧橙色粗描边 + 浅橙底，在长列表里一眼可辨 */
+    .ll-card-pending {
+        border-color: #ffd591;
+        background: #fffaf0;
+        border-left: 4px solid #fa8c16;
+    }
+    /* 多选模式：未选中的卡片整体压暗，选中项保持满亮度 */
+    .ll-card-selectmode {
+        opacity: 0.55;
+    }
+    .ll-card-selectmode.ll-card-selected {
+        opacity: 1;
+    }
+
+    .ll-card-head {
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+        min-width: 0;
+    }
+    /* 标题行：复选框 44×44 触控区 + 主播名（单行省略）+ 平台标签 */
+    .ll-card-title {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex: 1;
+        min-width: 0;
+    }
+    .ll-card-check {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 44px;
+        height: 44px;
+        margin: -10px 0 -10px -10px;
+        flex-shrink: 0;
+    }
+    .ll-card-check .ant-checkbox-inner {
+        width: 20px;
+        height: 20px;
+    }
+    .ll-card-name {
+        flex: 0 1 auto;
+        min-width: 0;
+        font-size: 16px;
+        font-weight: 600;
+        line-height: 22px;
+        color: rgba(0, 0, 0, 0.88);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .ll-card-platform {
+        flex-shrink: 0;
+        margin: 0;
+        font-size: 12px;
+        line-height: 20px;
+    }
+    /* 状态标签：允许换行，绝不省略（状态必须看全） */
+    .ll-card-tags {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+        margin-top: 6px;
+        min-width: 0;
+    }
+    .ll-card-tags .ant-tag {
+        margin: 0;
+        font-size: 12px;
+        line-height: 20px;
+    }
+    /* 副标题：直播间名（核心「操作对象」信息，单行省略，可点开原直播间） */
+    .ll-card-sub {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        margin-top: 4px;
+        min-width: 0;
+        font-size: 13px;
+        line-height: 20px;
+    }
+    .ll-card-room {
+        flex: 1;
+        min-width: 0;
+        color: #595959;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    /* 信息行：添加时间 / 最近直播 / 文件夹大小，自动换行 */
+    .ll-card-meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px 14px;
+        margin-top: 6px;
+        font-size: 12px;
+        line-height: 18px;
+        color: #8c8c8c;
+    }
+    /* 待删除挽留区 */
+    .ll-card-alert {
+        margin-top: 8px;
+        padding: 8px 10px;
+        background: #fff7e6;
+        border: 1px solid #ffd591;
+        border-radius: 8px;
+    }
+    .ll-card-alert-text {
+        font-size: 13px;
+        font-weight: 600;
+        line-height: 20px;
+        color: #d46b08;
+    }
+    .ll-card-alert-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 8px;
+    }
+    /* 操作行：按钮自动换行，不出现横向滚动 */
+    .ll-card-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 10px;
+    }
+    .ll-card-actions > * {
+        max-width: 100%;
+    }
+    .ll-btn {
+        min-height: 40px;
+        padding: 0 12px;
+        font-size: 14px;
+    }
+    /* 展开详情：宽度 100%（不再沿用桌面端展开行 1156px 的宽度） */
+    .ll-card-detail {
+        margin-top: 8px;
+        width: 100%;
+        max-width: 100%;
+        min-width: 0;
+    }
+    /* 详情内部任何超宽内容（长 URL / 长路径 / Headers）都在卡片内换行，不撑破页面 */
+    .ll-card-detail,
+    .ll-card-detail * {
+        max-width: 100%;
+        box-sizing: border-box;
+    }
+    .ll-card-detail .ant-tabs-nav-wrap {
+        overflow-x: auto;
+    }
+    .ll-card-detail pre,
+    .ll-card-detail code {
+        white-space: pre-wrap;
+        word-break: break-all;
+    }
+
+    /* ---- 底部批量操作条 ---- */
+    .ll-mobile-batchbar {
+        flex-shrink: 0;
+        padding: 8px 12px;
+        background: #fff;
+        border-top: 1px solid #e8e8e8;
+        box-shadow: 0 -2px 10px rgba(0, 0, 0, 0.08);
+        /* 适配 iPhone 底部安全区 */
+        padding-bottom: calc(8px + constant(safe-area-inset-bottom));
+        padding-bottom: calc(8px + env(safe-area-inset-bottom));
+    }
+    .ll-mobile-batchbar-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        min-width: 0;
+    }
+    .ll-mobile-batchbar-count {
+        font-size: 14px;
+        font-weight: 600;
+        color: #1677ff;
+        white-space: nowrap;
+    }
+    .ll-mobile-batchbar-hint {
+        font-size: 12px;
+        color: #8c8c8c;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+    .ll-mobile-batchbar-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 8px;
+    }
+    /* 底部批量条的按钮走 .ll-btn（组件里已挂该类），这里只兜底未被 .ll-btn 覆盖的按钮 */
+    .ll-mobile-batchbar-actions .ant-btn {
+        min-height: 40px;
+        font-size: 14px;
+    }
+
+    /* ---- 底部抽屉（自绘，不依赖 antd Drawer 的 API） ---- */
+    .ll-sheet-mask {
+        position: fixed;
+        top: 0;
+        right: 0;
+        bottom: 0;
+        left: 0;
+        z-index: 1100;
+        display: flex;
+        align-items: flex-end;
+        background: rgba(0, 0, 0, 0.45);
+    }
+    .ll-sheet {
+        width: 100%;
+        max-height: 85vh;
+        display: flex;
+        flex-direction: column;
+        background: #fff;
+        border-radius: 16px 16px 0 0;
+        box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.18);
+        animation: ll-sheet-up 0.2s ease-out;
+        /* 适配 iPhone 底部安全区 */
+        padding-bottom: constant(safe-area-inset-bottom);
+        padding-bottom: env(safe-area-inset-bottom);
+    }
+    @keyframes ll-sheet-up {
+        from {
+            transform: translateY(100%);
+        }
+        to {
+            transform: translateY(0);
+        }
+    }
+    .ll-sheet-header {
+        position: relative;
+        flex-shrink: 0;
+        padding: 14px 52px 14px 16px;
+        border-bottom: 1px solid #f0f0f0;
+    }
+    /* 抽屉顶部的小把手，暗示「可收起」 */
+    .ll-sheet-header::before {
+        content: '';
+        position: absolute;
+        top: 6px;
+        left: 50%;
+        width: 36px;
+        height: 4px;
+        margin-left: -18px;
+        border-radius: 2px;
+        background: #e0e0e0;
+    }
+    .ll-sheet-title {
+        font-size: 16px;
+        font-weight: 600;
+        color: rgba(0, 0, 0, 0.88);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+    .ll-sheet-subtitle {
+        display: block;
+        margin-top: 2px;
+        font-size: 12px;
+        font-weight: 400;
+        color: #8c8c8c;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+    .ll-sheet-close {
+        position: absolute;
+        top: 10px;
+        right: 8px;
+        width: 44px;
+        height: 44px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 16px;
+        color: #8c8c8c;
+        background: transparent;
+        border: none;
+        border-radius: 50%;
+        cursor: pointer;
+    }
+    .ll-sheet-close:active {
+        background: #f0f0f0;
+    }
+    .ll-sheet-body {
+        flex: 1;
+        min-height: 0;
+        overflow-y: auto;
+        overscroll-behavior: contain;
+        padding: 8px 12px 12px;
+    }
+    .ll-sheet-list {
+        display: flex;
+        flex-direction: column;
+    }
+    .ll-sheet-item {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        width: 100%;
+        min-height: 48px;
+        padding: 0 8px;
+        font-size: 15px;
+        color: rgba(0, 0, 0, 0.85);
+        text-align: left;
+        background: transparent;
+        border: none;
+        border-bottom: 1px solid #f5f5f5;
+        cursor: pointer;
+    }
+    .ll-sheet-item:active {
+        background: #f5f5f5;
+    }
+    .ll-sheet-item.danger {
+        color: #ff4d4f;
+    }
+    .ll-sheet-item.active {
+        color: #1677ff;
+        font-weight: 600;
+    }
+    .ll-sheet-item-icon {
+        flex-shrink: 0;
+        width: 20px;
+        font-size: 16px;
+        text-align: center;
+    }
+    .ll-sheet-item-label {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+    .ll-sheet-item-check {
+        flex-shrink: 0;
+        color: #1677ff;
+    }
+    .ll-sheet-item-hint {
+        flex-shrink: 0;
+        font-size: 12px;
+        color: #8c8c8c;
+    }
+    .ll-sheet-note {
+        padding: 10px 8px 0;
+        font-size: 12px;
+        line-height: 18px;
+        color: #8c8c8c;
+    }
+    .ll-sheet-actions {
+        display: flex;
+        gap: 8px;
+        padding-top: 12px;
+    }
+    .ll-sheet-actions .ant-btn {
+        min-height: 44px;
+        font-size: 15px;
+    }
+    .ll-sheet-form {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+    }
+    .ll-sheet-field {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+    }
+    .ll-sheet-field > label {
+        font-size: 13px;
+        color: #595959;
+    }
+    .ll-sheet-field .ant-input-affix-wrapper,
+    .ll-sheet-field .ant-select-selector {
+        min-height: 44px;
+        font-size: 15px;
+    }
+}
+
+/* 老设备兜底：与上面 max-width 版本等价的窄屏布局（关键结构 + 卡片 + 抽屉） */
+@media (max-device-width: 768px) {
+    .content-padding {
+        padding: 0 !important;
+        display: flex;
+        flex-direction: column;
+        flex: 1;
+        min-height: 0;
+        overflow: hidden !important;
+    }
+    .inside-content-padding {
+        padding: 0 !important;
+        display: flex;
+        flex-direction: column;
+        flex: 1;
+        min-height: 0;
+        overflow: hidden !important;
+    }
+    .ll-mobile-shell {
+        display: flex;
+        flex-direction: column;
+        height: 100%;
+        min-height: 0;
+        max-height: 100%;
+        min-width: 0;
+        overflow: hidden;
+        background: #f5f5f5;
+        box-sizing: border-box;
+    }
+    .ll-mobile-main {
+        display: flex;
+        flex-direction: column;
+        flex: 1;
+        min-height: 0;
+        min-width: 0;
+        overflow: hidden;
+    }
+    .ll-mobile-list {
+        flex: 1;
+        min-height: 0;
+        min-width: 0;
+        overflow-y: auto;
+        overflow-x: hidden;
+        -webkit-overflow-scrolling: touch;
+        padding: 10px 12px 16px;
+        box-sizing: border-box;
+    }
+    .ll-mobile-list > * {
+        max-width: 100%;
+    }
+    .ll-card {
+        position: relative;
+        background: #fff;
+        border: 1px solid #ebedf0;
+        border-radius: 12px;
+        margin-bottom: 10px;
+        padding: 12px;
+        box-sizing: border-box;
+        max-width: 100%;
+        overflow: hidden;
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+    }
+    .ll-card-selected {
+        border-color: #1677ff;
+        box-shadow: 0 0 0 2px rgba(22, 119, 255, 0.12);
+    }
+    .ll-card-pending {
+        border-color: #ffd591;
+        background: #fffaf0;
+        border-left: 4px solid #fa8c16;
+    }
+    .ll-card-selectmode {
+        opacity: 0.55;
+    }
+    .ll-card-selectmode.ll-card-selected {
+        opacity: 1;
+    }
+    .ll-card-name {
+        flex: 0 1 auto;
+        min-width: 0;
+        font-size: 16px;
+        font-weight: 600;
+        line-height: 22px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .ll-card-tags {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+        margin-top: 6px;
+        min-width: 0;
+    }
+    .ll-card-sub {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        margin-top: 4px;
+        min-width: 0;
+        font-size: 13px;
+        line-height: 20px;
+    }
+    .ll-card-room {
+        flex: 1;
+        min-width: 0;
+        color: #595959;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .ll-card-meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px 14px;
+        margin-top: 6px;
+        font-size: 12px;
+        line-height: 18px;
+        color: #8c8c8c;
+    }
+    .ll-card-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 10px;
+    }
+    .ll-card-detail,
+    .ll-card-detail * {
+        max-width: 100%;
+        box-sizing: border-box;
+    }
+    .ll-card-detail {
+        margin-top: 8px;
+        width: 100%;
+        min-width: 0;
+    }
+    .ll-btn {
+        min-height: 40px;
+        padding: 0 12px;
+        font-size: 14px;
+    }
+    .ll-mobile-batchbar {
+        flex-shrink: 0;
+        padding: 8px 12px;
+        background: #fff;
+        border-top: 1px solid #e8e8e8;
+        box-shadow: 0 -2px 10px rgba(0, 0, 0, 0.08);
+    }
+    .ll-mobile-batchbar-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 8px;
+    }
+    .ll-sheet-mask {
+        position: fixed;
+        top: 0;
+        right: 0;
+        bottom: 0;
+        left: 0;
+        z-index: 1100;
+        display: flex;
+        align-items: flex-end;
+        background: rgba(0, 0, 0, 0.45);
+    }
+    .ll-sheet {
+        width: 100%;
+        max-height: 85vh;
+        display: flex;
+        flex-direction: column;
+        background: #fff;
+        border-radius: 16px 16px 0 0;
+        box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.18);
+    }
+    .ll-sheet-header {
+        position: relative;
+        flex-shrink: 0;
+        padding: 14px 52px 14px 16px;
+        border-bottom: 1px solid #f0f0f0;
+    }
+    .ll-sheet-title {
+        font-size: 16px;
+        font-weight: 600;
+        color: rgba(0, 0, 0, 0.88);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+    .ll-sheet-body {
+        flex: 1;
+        min-height: 0;
+        overflow-y: auto;
+        overscroll-behavior: contain;
+        padding: 8px 12px 12px;
+    }
+    .ll-sheet-item {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        width: 100%;
+        min-height: 48px;
+        padding: 0 8px;
+        font-size: 15px;
+        text-align: left;
+        background: transparent;
+        border: none;
+        border-bottom: 1px solid #f5f5f5;
+        cursor: pointer;
+    }
+    .ll-sheet-item.danger {
+        color: #ff4d4f;
+    }
+    .ll-sheet-item.active {
+        color: #1677ff;
+        font-weight: 600;
+    }
+    .ll-sheet-actions {
+        display: flex;
+        gap: 8px;
+        padding-top: 12px;
+    }
+    .ll-sheet-actions .ant-btn {
+        min-height: 44px;
+    }
+}

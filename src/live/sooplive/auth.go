@@ -16,6 +16,8 @@ import (
 	"github.com/tidwall/gjson"
 	"golang.org/x/sync/singleflight"
 
+	"github.com/bililive-go/bililive-go/src/live"
+	"github.com/bililive-go/bililive-go/src/pkg/pause"
 	"github.com/bililive-go/bililive-go/src/pkg/utils"
 )
 
@@ -72,6 +74,13 @@ type LoginResult struct {
 // 2. 录制前的登录态预检；
 // 3. 登录成功后的二次确认。
 func VerifyCookieString(cookie string) (*CookieVerifyResult, error) {
+	// 需求8（软重启）：本函数用的是 newHTTPClient() 新建的独立 client，
+	// 不经过 BaseLive.RequestSession，因此 pause.WrapTransport 掐不到它；
+	// 在发请求前判定闸门，暂停期间直接返回，一个上游请求都不发。
+	if pause.Default().IsPaused() {
+		return nil, live.ErrSoftRestartPaused
+	}
+
 	client := newHTTPClient()
 	req, err := http.NewRequest(http.MethodGet, authCheckEndpoint, nil)
 	if err != nil {
@@ -116,6 +125,12 @@ func VerifyCookieStringCached(cookie string) (*CookieVerifyResult, error) {
 func LoginAndGetCookie(username, password string) (*LoginResult, error) {
 	if strings.TrimSpace(username) == "" || strings.TrimSpace(password) == "" {
 		return nil, fmt.Errorf("soop 登录失败：账号或密码为空")
+	}
+
+	// 需求8（软重启）：登录同样走独立 client（newHTTPClient），传输层包装覆盖不到。
+	// 在真正发请求前拦一道：暂停期间直接返回，避免软重启窗口里发出登录/校验请求。
+	if pause.Default().IsPaused() {
+		return nil, live.ErrSoftRestartPaused
 	}
 
 	jar, err := cookiejar.New(nil)
@@ -223,6 +238,13 @@ func verifyCookieWithCache(cookie string) (*CookieVerifyResult, error) {
 
 	if cached, ok := loadCachedVerifyResult(cookie); ok {
 		return cached, nil
+	}
+
+	// 需求8（软重启）：缓存未命中才会真正发起上游校验请求，因此在进 singleflight 之前判定。
+	// 放在缓存查询之后：命中缓存是纯内存读取，不需要被闸门拦下，也避免暂停期间让面板
+	// 上「已验证过」的状态凭空变红。
+	if pause.Default().IsPaused() {
+		return nil, live.ErrSoftRestartPaused
 	}
 
 	value, err, _ := verifyCookieGroup.Do(cookie, func() (any, error) {

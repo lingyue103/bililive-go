@@ -23,11 +23,18 @@ import (
 	"time"
 
 	"github.com/tidwall/gjson"
+
+	"github.com/bililive-go/bililive-go/src/pkg/pause"
 )
 
 // ErrLoginInvalid 表示"凭证本身失效"（LTP0 过期、换票缺字段、探针判定未登录），
 // 需要用户重新扫码；区别于网络抖动等临时性错误（不应据此打扰用户）。
 var ErrLoginInvalid = errors.New("斗鱼登录凭证已失效")
+
+// ErrSoftRestartPaused 是软重启暂停闸门（需求8）拦下本次请求时返回的哨兵错误。
+// 必须与"临时性网络错误"区分开：续期失败路径会据此安排退避甚至升级为"需要重新扫码"的
+// 用户提醒，而暂停期间跳过请求既不是失败、也不该推迟续期日程，所以调用方要能精确识别它。
+var ErrSoftRestartPaused = errors.New("暂停中，跳过本次平台请求")
 
 // safeAuthUrl/probeUrl 声明为 var 而非 const：两者都是"续期是否真的成功"的唯一判定点，
 // 需要在单元测试里指向 httptest 服务器，才能覆盖风控页/非 JSON 响应等真实故障形态。
@@ -137,6 +144,14 @@ func RefreshLoginCookie(ctx context.Context, ltp0, dyDid string) (map[string]str
 	if strings.TrimSpace(ltp0) == "" {
 		return nil, fmt.Errorf("缺少 LTP0，无法续期")
 	}
+	// 需求8（软重启）：换票链用的是本包独立的 douyuHTTPClient，不经 BaseLive.RequestSession，
+	// pause.WrapTransport 覆盖不到，因此在发起请求前判定闸门。
+	// 正常路径上调用方（servers/douyu_keeper.go 的 refreshDouyuCookieIfDue）已经拦住，
+	// 这里是兜底：保证任何直接调用者都不会在暂停期间打出 safeAuth 这类登录类请求。
+	if pause.Default().IsPaused() {
+		return nil, ErrSoftRestartPaused
+	}
+
 	cookie := "LTP0=" + ltp0
 	if dyDid != "" {
 		cookie = "dy_did=" + dyDid + "; " + cookie

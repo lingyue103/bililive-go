@@ -66,6 +66,12 @@ type Parser struct {
 	cmdLock    sync.Mutex
 	logger     *livelogger.LiveLogger
 
+	// stderrDetector 检测 ffmpeg stderr 里是否出现过「存储不足」文本。
+	// 由 ParseLiveStream 在持有 cmdLock 时随 p.cmd 一起重建；进程退出后用它的
+	// IsStorageFull() 判定是否要把错误包装成 parser.ErrStorageFull。可以为 nil
+	// （例如进程尚未启动），使用前必须判空。
+	stderrDetector *parser.StorageFullDetectingWriter
+
 	// FLV 代理相关
 	flvProxy     *flvproxy.FLVProxy
 	flvProxyMu   sync.Mutex
@@ -279,11 +285,16 @@ func (p *Parser) ParseLiveStream(ctx context.Context, streamUrlInfo *live.Stream
 		if p.cmdStdout, err = p.cmd.StdoutPipe(); err != nil {
 			return
 		}
-		// 将 ffmpeg 的 stderr 输出写入到 live logger，同时也输出到 os.Stderr
-		p.cmd.Stderr = io.MultiWriter(
+		// 将 ffmpeg 的 stderr 输出写入到 live logger，同时也输出到 os.Stderr。
+		// 外面再包一层「存储不足文本」检测器：ffmpeg 写盘失败时只会把 ENOSPC 之类的原因打到
+		// stderr，而 cmd.Wait() 返回的 *exec.ExitError 文本只有 "exit status 1"，
+		// 上层无法据此抑制磁盘写满时的重试风暴（见 parser.ErrStorageFull 的说明）。
+		// 检测器与 p.cmd 一起在 cmdLock 内创建：每次录制只服务一个进程，不存在多进程串台。
+		p.stderrDetector = parser.NewStorageFullDetectingWriter(io.MultiWriter(
 			utils.NewLogFilterWriter(os.Stderr),
 			utils.NewLoggerWriter(p.logger),
-		)
+		))
+		p.cmd.Stderr = p.stderrDetector
 		if err = p.cmd.Start(); err != nil {
 			if p.cmd.Process != nil {
 				p.cmd.Process.Kill()
@@ -305,6 +316,11 @@ func (p *Parser) ParseLiveStream(ctx context.Context, streamUrlInfo *live.Stream
 	p.stopFlvProxy()
 
 	if err != nil {
+		// 磁盘写满等存储不足：ffmpeg 的退出码一样是 1，只有 stderr 里能看出原因，
+		// 这里把它包装成 parser.ErrStorageFull，供 recorders 判定并启用退避。
+		if p.stderrDetector != nil && p.stderrDetector.IsStorageFull() {
+			return parser.StorageFullError(err, true)
+		}
 		return err
 	}
 	return nil

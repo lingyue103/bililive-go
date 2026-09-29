@@ -14,8 +14,14 @@ import (
 	"time"
 
 	"github.com/bililive-go/bililive-go/src/pkg/livelogger"
+	"github.com/bililive-go/bililive-go/src/pkg/pause"
 	"github.com/bililive-go/bililive-go/src/pkg/proxy"
 )
+
+// errSoftRestartPaused 是软重启暂停闸门拦下探测请求时返回的哨兵错误（需求8）。
+// 文案与 live.ErrSoftRestartPaused 一致：探测失败只影响「分辨率探测」这类增强信息，
+// 上层（recorder）会把它当作普通探测失败处理，不影响录制流程。
+var errSoftRestartPaused = errors.New("暂停中，跳过本次平台请求")
 
 const (
 	// maxProbeTags 探测阶段最多读取的 tag 数量
@@ -129,6 +135,13 @@ func (p *StreamProbe) GetHeaderInfo() *StreamHeaderInfo {
 
 // connectUpstream 连接上游直播流
 func (p *StreamProbe) connectUpstream() error {
+	// 需求8（软重启）：本探测代理自建 http.Client/Transport，不经过 BaseLive.RequestSession，
+	// pause.WrapTransport 覆盖不到，因此在真正发起上游请求之前判定闸门。
+	// 这里只拦「新请求」：暂停前已经在途的上游长连接由调用方（recorder 停止录制）负责断开。
+	if pause.Default().IsPaused() {
+		return errSoftRestartPaused
+	}
+
 	// 创建带下载代理的 HTTP 客户端
 	transport := &http.Transport{
 		DialContext: (&net.Dialer{

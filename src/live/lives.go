@@ -204,6 +204,14 @@ type StreamUrlInfo struct {
 	IsPlaceHolder bool `json:"is_placeholder"`
 }
 
+// IsSoftRestartPaused 判断当前是否处于软重启暂停闸门期间（需求8）。
+//
+// 这是 pause 包 Default().IsPaused() 的薄封装，仅为让 live 族的错误构造集中在一处、
+// 语义自解释。判定是无锁读（内部只有一次 RLock 取时间戳），可安全用于高频轮询路径。
+func IsSoftRestartPaused() bool {
+	return pause.Default().IsPaused()
+}
+
 type Live interface {
 	SetLiveIdByString(string)
 	GetLiveId() types.LiveID
@@ -230,6 +238,23 @@ type Live interface {
 // ErrPlatformToolsNotReady 表示直播间所属平台依赖的外部工具还没就绪，
 // 此时不应该发起请求，也不应该按「获取失败」来对待（不是平台或网络的问题）。
 var ErrPlatformToolsNotReady = errors.New("平台依赖的工具尚未就绪")
+
+// ErrSoftRestartPaused 表示软重启暂停闸门（需求8）正在生效，本次平台请求被主动拦下。
+//
+// 与 ErrPlatformToolsNotReady 同构：这是「本进程主动不发请求」，既不是平台故障也不是网络故障，
+// 因此调用方不该按失败统计/退避来处理（WrappedLive.GetInfo 也不会记入连续失败）。
+// 调用方可以用 errors.Is(err, ErrSoftRestartPaused) 精确识别；错误文本保持中文，便于直接展示。
+var ErrSoftRestartPaused = errors.New("暂停中，跳过本次平台请求")
+
+// softRestartPausedError 构造暂停闸门拦下请求时的错误。
+// 带上暂停原因便于日志与前端解释「为什么这次请求没发出去」；原因为空时只返回基础错误，
+// 避免出现「（原因：）」这样的空括号。
+func softRestartPausedError() error {
+	if reason := pause.Default().Snapshot().Reason; reason != "" {
+		return fmt.Errorf("%w（原因：%s）", ErrSoftRestartPaused, reason)
+	}
+	return ErrSoftRestartPaused
+}
 
 const (
 	// defaultInterval 没有配置轮询间隔时使用的默认值
@@ -358,6 +383,23 @@ func (w *WrappedLive) GetInfo() (*Info, error) {
 	w.requestMu.Lock()
 	defer w.requestMu.Unlock()
 
+	// 需求8（软重启）：暂停闸门期间不发任何平台请求，直接返回。
+	//
+	// 这里刻意放在最前面：调度器循环虽然也会拦住自动轮询，但 listener.refresh、
+	// handler 的 forceRefresh、live.New 的初始化重试、OSRP 外部接口等调用方都会
+	// 直接调用本方法，必须在唯一入口统一下沉闸门，否则这些路径会在暂停期间照常发请求。
+	//
+	// 返回的是「本进程主动跳过」的哨兵错误，且**不**调用 recordRequestResult ——
+	// 与下方「被闸门掐断的请求不记失败」同一口径：不推进 lastRequestAt、不涨连续失败计数，
+	// 这样闸门一放开就能立刻发出第一个恢复请求，也不会因退避把恢复时间拖长。
+	// 仍然要 notifyWaiters：否则卡在 GetInfoWithInterval 上的调用方（如 listener.refresh）
+	// 会一直挂到暂停结束，拿不到「本轮被跳过」这个结果。
+	if IsSoftRestartPaused() {
+		err := softRestartPausedError()
+		w.notifyWaiters(nil, err)
+		return nil, err
+	}
+
 	// 依赖的外部工具还没就绪时不发请求（调度器之外还有 listener.refresh 等直接调用方）。
 	// 正常情况下调度器会先拦住，这里主要覆盖直接调用以及「刚检查完就绪、随即工具挂掉」的竞态，
 	// 因此同样要通知等待者，避免它们一直挂着。
@@ -435,6 +477,23 @@ func (w *WrappedLive) GetInfo() (*Info, error) {
 	w.dispatchSchedulerRefreshEvent()
 
 	return i, nil
+}
+
+// GetStreamInfos 是 WrappedLive 对平台「取流地址」入口的闸门封装（需求8）。
+//
+// 为什么必须显式实现这一层：WrappedLive 内嵌了 Live 接口，若不覆写，
+// GetStreamInfos 会沿着嵌入接口**直接落到平台实现**，完全绕过 GetInfo 里的闸门。
+// 实际存在这样的调用路径：recorders 取流地址（recorder.tryRecord）以及
+// OSRP 外部接口 /osrp/v1/streams/{platform}/{id}/urls，暂停期间都必须立即拦住。
+//
+// 与 GetInfo 的闸门同构：直接返回哨兵错误，不获取平台请求许可、不发任何请求。
+// 调用方把本错误当作普通失败处理即可 —— recorder 会记一条重试日志并在 5 秒后再试，
+// 那时闸门通常已经放开；不会触发封禁/退避逻辑。
+func (w *WrappedLive) GetStreamInfos() ([]*StreamUrlInfo, error) {
+	if IsSoftRestartPaused() {
+		return nil, softRestartPausedError()
+	}
+	return w.Live.GetStreamInfos()
 }
 
 // recordRequestResult 更新调度器的请求时间和连续失败计数。

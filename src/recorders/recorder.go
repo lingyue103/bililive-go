@@ -79,10 +79,19 @@ var (
 
 // isDiskWriteFailure 判断错误是否属于「磁盘写入失败」（最常见的是磁盘写满）。
 // 用于在磁盘满时抑制录制重试风暴：此时继续每 5 秒重试只会不断产生新的空文件。
-// 采用错误文本匹配而非 syscall.ENOSPC，以保持跨平台（Linux 与 Windows 的错误文案不同）。
+//
+// 判定分两步：
+//  1. 优先认 parser.ErrStorageFull 哨兵错误 —— ffmpeg（默认下载器）与录播姬的 stderr 只被写进
+//     日志，cmd.Wait() 返回的 *exec.ExitError 文本只有 "exit status 1"，靠文本匹配**永远**命不中；
+//     由解析器在观察到 stderr 里的存储不足文本后把该哨兵包装进错误。
+//  2. 保留错误文本匹配作为兜底（native 解析器、os 层 syscall 错误仍会原样带上 ENOSPC 文案），
+//     跨平台（Linux 与 Windows 的错误文案不同）都能识别。
 func isDiskWriteFailure(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, parser.ErrStorageFull) {
+		return true
 	}
 	msg := strings.ToLower(err.Error())
 	for _, kw := range []string{
@@ -92,12 +101,32 @@ func isDiskWriteFailure(err error) bool {
 		"disk full",                     // 通用
 		"insufficient storage",          // WebDAV / 部分挂载
 		"quota exceeded",                // 群晖配额限制
+		"disk quota exceeded",           // 群晖配额限制的另一种文案
+		"enospc",                        // 直接把 errno 名字打进日志的实现
 	} {
 		if strings.Contains(msg, kw) {
 			return true
 		}
 	}
 	return false
+}
+
+// isResumablePartialRecording 判断「录制失败但已写入有效数据」的文件是否值得送去后处理。
+//
+// 为什么需要：连接中断、上游 404、磁盘写满、以及被 Stop() 主动掐断（含软重启掐断）都会让
+// ParseLiveStream 返回错误、落进失败分支。此前这些残缺 flv 会被永久留在磁盘上，既不转码
+// 也不删除，是"大量 flv 没被转码"的重要成因。fix_flv 阶段对截断的 flv 往往能修复，因此
+// 只要文件确实写入了有意义的数据就应该尝试，而不是静默留在处理链路之外。
+//
+// 门槛取 1 MiB：足以排除 404 秒退、写失败产生的空文件与几十字节碎片，又不会漏掉真正
+// 录到内容的片段（即使是只录了几秒的短直播，通常也远超 1 MiB）。
+func isResumablePartialRecording(file string) bool {
+	const minBytes = 1 << 20 // 1 MiB
+	fi, err := os.Stat(file)
+	if err != nil || fi.IsDir() {
+		return false
+	}
+	return fi.Size() >= minBytes
 }
 
 // videoExtensions 用于匹配弹幕文件对应的视频文件
@@ -507,6 +536,13 @@ func (r *recorder) tryRecord(ctx context.Context) {
 
 	if err = mkdir(outputPath); err != nil {
 		r.getLogger().WithError(err).Errorf("failed to create output path[%s]", outputPath)
+		// 【修复漏判】此前这里直接 return，不增加写入失败连击，导致「磁盘满 + 目录建不出来」
+		// 时 writeFailStreak 恒为 0、run() 的 60s 退避永不启用，仍是每 5 秒重试一次。
+		// 目录创建失败本身就是典型的写入失败（最常见原因就是磁盘/配额写满），照样计入连击；
+		// 复用失败分支已有的计数与退避逻辑（writeFailStreak + run() 的阈值判定），不另造一套。
+		// 这里不按 isDiskWriteFailure 过滤：权限/只读挂载等失败同样会 5 秒一次地空转重试，
+		// 计入连击只会让退避更保守，不会改变成功路径的行为（成功录制时 run() 会清零）。
+		r.writeFailStreak.Add(1)
 		return
 	}
 	// 需求3：在录制目录写入归属标识文件，供"文件夹大小"统计准确识别目录归属。
@@ -748,8 +784,36 @@ func (r *recorder) tryRecord(ctx context.Context) {
 		// （每次重试都是新文件名），短时间内就会堆积成百上千个 0KB 文件。
 		removeEmptyFile(fileName)
 		// 记录写失败，供 run() 做退避，避免磁盘写满时的重试风暴
-		if isDiskWriteFailure(err) {
+		diskFailure := isDiskWriteFailure(err)
+		if diskFailure {
 			r.writeFailStreak.Add(1)
+		}
+
+		// 【中断录制也要走后处理】
+		//
+		// 连接中断、上游 404、磁盘写满、以及被 Stop() 主动掐断（含软重启掐断）都会走到本分支。
+		// 此前这些残缺 flv 会被**永久留在磁盘上，既不转码也不删除** —— 这是"大量 flv 没被
+		// 转码"的重要成因之一（线上实测残留 220 个）。只要文件确实写入了有意义的数据，
+		// 就应该交给后处理：fix_flv 阶段对截断的 flv 往往能修复；即便修复失败，也只是多一个
+		// 失败任务（有记录可查），不会比"静默留盘"更糟。
+		//
+		// 【D18 修复】此前磁盘写满（diskFailure）时被整体跳过，而满盘恰恰是"半截 flv"最主要的
+		// 来源：ffmpeg 的 -y 先建文件、写到一半 ENOSPC 退出，留下 size>0 的残缺文件。
+		// 跳过它 = 该文件在整个处理链路之外，既不修复也不进摘要、不进任何通知，永久留盘。
+		// 现在只保留体积门槛（见 isResumablePartialRecording，排除 404 秒退产生的碎片），
+		// 满盘留下的半截文件同样交给后处理：fix_flv 对截断的 flv 往往能修复；修复阶段若仍
+		// 因空间不足失败，也只是多一个可重试的失败任务，不会比静默留盘更糟。
+		//
+		// 注意：中断片段**不参与小文件合并**（它是残缺的，不应与完整片段拼接），直接后处理；
+		// size==0 的残留已由上面的 removeEmptyFile 删除，这里的体积门槛保证它不会再进入后处理。
+		if isResumablePartialRecording(fileName) {
+			if diskFailure {
+				r.getLogger().Warnf("磁盘写入失败且已留下残缺文件，仍交由后处理尝试修复（满盘时修复可能失败）：%s", fileName)
+			} else {
+				r.getLogger().Warnf("录制中断但已写入有效数据，仍交由后处理尝试修复：%s", fileName)
+			}
+			r.accumulateRecordedFiles(fileName)
+			r.doPostProcess(ctx, []string{fileName}, nil, resolvedConfig, cfg, info)
 		}
 		return
 	}

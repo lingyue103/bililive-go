@@ -22,6 +22,10 @@ type nameIndex struct {
 	lower map[string]string
 	// all 全部候选（规范化名 + live_id），按名字长度降序，用于「互相包含」兜底匹配
 	all []namePair
+	// valid 当前配置里真实存在的 live_id 集合。
+	// 用于校验 .bililive-room-id 标识文件里的 id：LiveId 运行期变化后，历史目录里的标识
+	// 可能已指向一个不存在的直播间，此时必须退回名称匹配，不能把字节数记到孤儿 id 上。
+	valid map[string]bool
 }
 
 // namePair 一条候选名记录
@@ -36,6 +40,7 @@ func buildNameIndex(roomIndex map[string][]string) *nameIndex {
 	idx := &nameIndex{
 		exact: make(map[string]string, len(roomIndex)),
 		lower: make(map[string]string, len(roomIndex)),
+		valid: make(map[string]bool, len(roomIndex)),
 	}
 	if len(roomIndex) == 0 {
 		return idx
@@ -49,6 +54,9 @@ func buildNameIndex(roomIndex map[string][]string) *nameIndex {
 
 	seen := make(map[string]bool)
 	for _, id := range ids {
+		// 只要在当前配置里出现过的 live_id 就算有效，即使它没有任何可用的候选名
+		// （名字全为空时下面的循环不会产出任何索引项，但该 id 依然真实存在）
+		idx.valid[id] = true
 		for _, name := range roomIndex[id] {
 			norm := normalizeName(name)
 			if norm == "" {
@@ -122,15 +130,27 @@ func normalizeName(s string) string {
 // resolveOwner 判定一个候选主播目录归属于哪个 live_id。
 //
 // 优先级（与需求一致）：
-//  1. 标识文件优先：目录下 .bililive-room-id 的第一行就是 live_id（录制时写入，最可靠）；
+//  1. 标识文件优先：目录下 .bililive-room-id 的第一行就是 live_id（录制时写入，最可靠），
+//     但**必须**该 id 在当前配置的索引里真实存在；否则视为失效标识，退回名称匹配；
 //  2. 存量目录按名兜底：目录名与调用方给的候选名做宽松匹配——
 //     先「规范化后精确匹配」，再「小写精确匹配」，最后「互相包含」兜底
 //     （目录名可能被 sanitize、被截断、带 emoji 或额外后缀）。
 //
 // 都不命中时返回空字符串，表示这个目录不属于任何已知直播间。
+//
+// 为什么标识文件要做有效性校验（D9）：LiveId 会在运行期变化——CustomLiveId 覆盖、
+// listener 初始化完成后 ReplaceKey、抖音短链迁移到长链等都会换一个 id。历史目录里写下的
+// 标识因此可能指向一个**当前已不存在**的 live_id。若直接采信，该目录的字节数会被记到一个
+// 孤儿 id 上：当前房间查不到大小、前端显示「-」，用户以为没录到（文件其实都在盘上）。
+// 这类目录退回名称匹配后，通常仍能正确归属到改名后的同一个直播间。
 func resolveOwner(dir, name string, idx *nameIndex) string {
-	if id := readRoomIDFile(dir); id != "" {
-		return id
+	// 标识文件必须先在 roomIndex（当前配置里的真实 live_id 集合）中校验有效性。
+	// idx.valid 为空（调用方还没设置过 roomIndex）时同样走名称兜底，保持既有语义。
+	markerID := readRoomIDFile(dir)
+	if markerID != "" {
+		if idx != nil && idx.valid[markerID] {
+			return markerID
+		}
 	}
 	if idx == nil {
 		return ""

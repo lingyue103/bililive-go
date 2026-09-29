@@ -40,8 +40,16 @@ import (
 )
 
 const (
-	// ffprobeVerifyTimeout 单个片段校验的超时时间；超时视为坏片段（避免偶发的 ffprobe 卡死拖住合并）
+	// ffprobeVerifyTimeout 单个片段校验的**基准**超时时间。
+	// 实际超时会按文件大小放大（见 verifyTimeoutFor）：
+	// 在群晖这类慢盘上（再加上 7TB 满盘、与录制抢 I/O），一个几 GB 的 flv 光是读元数据
+	// 就可能超过 30 秒；而「超时」会被判为坏片段 → 好文件被剔除出合并。
 	ffprobeVerifyTimeout = 30 * time.Second
+	// ffprobeVerifyTimeoutMax 按大小放大后的上限，避免真正卡死的 ffprobe 长时间占用
+	ffprobeVerifyTimeoutMax = 5 * time.Minute
+	// ffprobeVerifyBytesPerSecond 推算超时时假设的最慢读取速度（保守取值：8 MiB/s）。
+	// 真机顺序读通常远快于此，这里取保守值是为了「宁可多等，也不误判好文件为坏片段」。
+	ffprobeVerifyBytesPerSecond = 8 << 20
 	// segmentMergeTimeout ffmpeg concat 合并的整体超时时间。合并只是流拷贝（-c copy），
 	// 但大文件（数 GB）在机械盘/网络存储上仍然较慢，给足余量
 	segmentMergeTimeout = 30 * time.Minute
@@ -77,7 +85,22 @@ type mergeQueue struct {
 	// gen 每次追加文件/重置定时器时自增。定时器回调会带上派发时的 gen 进行校验，
 	// 避免「定时器已触发但尚未执行、此刻又有新文件到来并重置了定时器」导致的提前冲刷。
 	gen uint64
+	// firstAddedAt 本队列第一个片段的加入时间，用于「最长滞留」硬上限。
+	firstAddedAt time.Time
 }
+
+const (
+	// segmentMergeMaxHold 单个合并队列的最长滞留时长。
+	//
+	// 为什么需要：窗口每次有新片段到来都会重置定时器。对于「分片间隔 < wait_minutes」的长直播
+	// （max_duration / max_file_size / FLV 代理 SPS-PPS 分段 / 录播姬 _PART 轮转都会造成分片），
+	// 定时器会被**无限顺延** —— 整场直播都不做任何后处理，队列在内存里无限增长，
+	// 直到停播才一次性合并（可能几十 GB，且要等很久）。这里给一个硬上限，到点强制冲刷。
+	segmentMergeMaxHold = 60 * time.Minute
+	// segmentMergeMaxSegments 单个合并队列允许累积的最大片段数，达到即强制冲刷。
+	// 与 maxHold 互为兜底：短时间内产生大量片段时也要及时处理，避免内存与磁盘占用失控。
+	segmentMergeMaxSegments = 8
+)
 
 // SegmentMerger 小文件合并管理器（并发安全）。
 type SegmentMerger struct {
@@ -155,6 +178,7 @@ func (m *SegmentMerger) SubmitFiles(
 	}
 
 	var conflict *mergeQueue
+	var immediate *mergeQueue
 
 	m.mu.Lock()
 	q := m.queues[liveID]
@@ -182,21 +206,42 @@ func (m *SegmentMerger) SubmitFiles(
 	q.flush = flush
 	q.ffmpegPath = ffmpegPath
 	q.files = append(q.files, valid...)
-	// 窗口内有新文件到来：重置定时器，把冲刷时间往后延
-	q.gen++
-	gen := q.gen
-	if q.timer != nil {
-		q.timer.Stop()
+	if q.firstAddedAt.IsZero() {
+		q.firstAddedAt = time.Now()
 	}
-	q.timer = time.AfterFunc(wait, func() {
-		m.onTimer(liveID, q, gen)
-	})
+
+	// 硬上限：滞留过久或片段过多时不再顺延，立即冲刷。
+	// 否则「分片间隔 < wait_minutes」的长直播会让定时器被无限重置，整场都不做后处理。
+	held := time.Since(q.firstAddedAt)
+	if held >= segmentMergeMaxHold || len(q.files) >= segmentMergeMaxSegments {
+		if q.timer != nil {
+			q.timer.Stop()
+		}
+		delete(m.queues, liveID)
+		immediate = q
+	} else {
+		// 窗口内有新文件到来：重置定时器，把冲刷时间往后延
+		q.gen++
+		gen := q.gen
+		if q.timer != nil {
+			q.timer.Stop()
+		}
+		q.timer = time.AfterFunc(wait, func() {
+			m.onTimer(liveID, q, gen)
+		})
+	}
 	m.mu.Unlock()
 
 	if conflict != nil {
 		// 旧队列的冲刷放到 goroutine 中执行：后处理（尤其 legacy 自定义命令）可能耗时很久，
 		// 不能阻塞本次录制流程。此队列已被摘除，不会再被 Submit/定时器触碰，无竞态。
 		go m.flushQueue(conflict)
+	}
+	if immediate != nil {
+		blog.GetLogger().WithField("live_id", string(liveID)).Warnf(
+			"合并队列已达硬上限（已滞留 %s、累计 %d 个片段），提前冲刷进入后处理",
+			held.Truncate(time.Second), len(immediate.files))
+		go m.flushQueue(immediate)
 	}
 	return true
 }
@@ -252,8 +297,10 @@ func (m *SegmentMerger) flushQueue(q *mergeQueue) {
 	}
 
 	mergeList := files
+	var dropped []string // 校验未通过、被剔除出合并的片段
 	if q.cfg.VerifySegments {
 		mergeList = m.filterPlayableSegments(q, files)
+		dropped = droppedFiles(files, mergeList)
 		switch {
 		case len(mergeList) == 0:
 			// 所有片段都判定为无法播放：不能因此丢掉后处理，回退为原始列表（Pipeline 的 fix_flv
@@ -262,13 +309,19 @@ func (m *SegmentMerger) flushQueue(q *mergeQueue) {
 			flush(files, nil)
 			return
 		case len(mergeList) == 1:
-			// 只剩一个可解码片段，无需合并；坏片段按需求被剔除，不进入后处理
+			// 只剩一个可解码片段，无需合并直接后处理。
+			//
+			// 注意：被剔除的片段**仍然要送去后处理**。此前它们既不参与合并、也不进入后处理，
+			// 会永久留在磁盘上保持 flv 状态 —— 这正是"很多 flv 没被转码"的直接成因之一。
+			// 它们或许确实是坏片段，但应交给 Pipeline 的 fix_flv 去尝试修复（修不好会明确
+			// 失败并留痕），而不是被静默丢弃在处理链路之外。
 			logger.Warnf("校验后仅剩 1 个可解码片段（原有 %d 个），跳过合并直接后处理", len(files))
 			flush(mergeList, nil)
+			flushDropped(q.liveID, flush, dropped)
 			return
-		case len(mergeList) < len(files):
+		case len(dropped) > 0:
 			logger.Warnf("校验后剔除 %d 个无法播放的片段，合并剩余 %d 个",
-				len(files)-len(mergeList), len(mergeList))
+				len(dropped), len(mergeList))
 		}
 	}
 
@@ -281,7 +334,63 @@ func (m *SegmentMerger) flushQueue(q *mergeQueue) {
 		return
 	}
 	logger.Infof("片段合并成功：%s（由 %d 个片段合并）", merged, len(mergeList))
+	// 合并产物走后处理；同时把未参与合并的片段也送进去（见 flushDropped 注释）
 	flush([]string{merged}, mergeList)
+	flushDropped(q.liveID, flush, dropped)
+}
+
+// verifyTimeoutFor 按文件大小推算 ffprobe 校验应该给多久。
+//
+// 为什么需要按大小放大：ffprobe 至少要扫过容器头与索引，磁盘 I/O 受限时（群晖慢盘、
+// 满盘、又与录制抢 I/O）几 GB 的 flv 可能远超 30 秒。而超时会被判成「坏片段」，
+// 于是好文件被剔除出合并、在加入 flushDropped 之前甚至会被摘出整个后处理链路。
+// 宁可多等一会儿，也不要误判用户的好文件。
+func verifyTimeoutFor(file string) time.Duration {
+	timeout := ffprobeVerifyTimeout
+	if fi, err := os.Stat(file); err == nil && fi.Size() > 0 {
+		// 按「保守顺序读速度」折算所需时间
+		bySize := time.Duration(fi.Size()/int64(ffprobeVerifyBytesPerSecond)) * time.Second
+		if bySize > timeout {
+			timeout = bySize
+		}
+	}
+	if timeout > ffprobeVerifyTimeoutMax {
+		timeout = ffprobeVerifyTimeoutMax
+	}
+	return timeout
+}
+
+// droppedFiles 返回 files 中不在 keep 里的文件（保持原顺序）。
+// 用于识别被片段校验剔除的文件，确保它们不会被静默留在处理链路之外。
+func droppedFiles(files, keep []string) []string {
+	if len(keep) == len(files) {
+		return nil
+	}
+	keepSet := make(map[string]struct{}, len(keep))
+	for _, f := range keep {
+		keepSet[f] = struct{}{}
+	}
+	var dropped []string
+	for _, f := range files {
+		if _, ok := keepSet[f]; !ok {
+			dropped = append(dropped, f)
+		}
+	}
+	return dropped
+}
+
+// flushDropped 把校验未通过、未参与合并的片段单独送去后处理。
+//
+// 为什么必须做：在本修复之前，这些片段「既不合并、也不后处理」，会永久留在磁盘上保持 flv
+// 状态，用户看到的就是"大量 flv 没被转码"。它们不参与合并是产品要求（避免坏片段污染合并
+// 结果），但不该因此被排除出整个后处理链路。
+func flushDropped(liveID types.LiveID, flush segmentFlushFunc, dropped []string) {
+	if len(dropped) == 0 || flush == nil {
+		return
+	}
+	blog.GetLogger().WithField("live_id", string(liveID)).
+		Warnf("校验未通过的 %d 个片段将单独进入后处理（不参与合并，但不应静默留盘）", len(dropped))
+	flush(dropped, nil)
 }
 
 // filterPlayableSegments 逐个校验片段，返回可正常解码的片段列表。
@@ -321,9 +430,9 @@ func (m *SegmentMerger) filterPlayableSegments(q *mergeQueue, files []string) []
 //   - ffprobe 不存在 / 无法启动（exec.ErrNotFound 等）→ 视为「好片段」。
 //     理由：工具缺失属于环境问题，不能因此丢弃用户文件；此时合并仍会执行，
 //     若真的合并失败，上层会回退为按原始文件列表后处理，不会丢数据。
-//   - 超时（默认 30 秒）→ 视为坏片段。
+//   - 超时 → 视为坏片段（超时上限按文件大小放大，见 verifyTimeoutFor）
 func (m *SegmentMerger) verifySegment(file, ffprobePath string) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), ffprobeVerifyTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), verifyTimeoutFor(file))
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, ffprobePath,

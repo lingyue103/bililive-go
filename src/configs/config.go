@@ -1406,7 +1406,57 @@ func mergeDuplicatedRoom(keep *LiveRoom, dropped LiveRoom) (adopted, conflicted 
 	mergeRoomPtr("stream_preference", &keep.StreamPreference, dropped.StreamPreference, &adopted, &conflicted)
 	mergeRoomPtr("danmaku_enable", &keep.DanmakuEnable, dropped.DanmakuEnable, &adopted, &conflicted)
 	mergeRoomPtr("danmaku", &keep.Danmaku, dropped.Danmaku, &adopted, &conflicted)
+	// 【D17】添加时间与一次性录制状态：这些字段由后台自动改写（停播超时把房间标成待删除、
+	// foldersize 兜底回填 AddedAt），整条丢弃等于把它们静默清空并随本次加载写回磁盘——
+	// 表现为"待删除"的房间重启后又开始录制、删除计时从头再来。口径与其它值类型字段一致：
+	// 先条为零值（这条写法没设置）时才用后条补齐，两边都设置且不同记为冲突。
+	mergeRoomValue("added_at", &keep.AddedAt, dropped.AddedAt, &adopted, &conflicted)
+	mergeRoomValue("is_one_time", &keep.IsOneTime, dropped.IsOneTime, &adopted, &conflicted)
+	mergeRoomValue("one_time_status", &keep.OneTimeStatus, dropped.OneTimeStatus, &adopted, &conflicted)
+	mergeRoomValue("one_time_last_live_end", &keep.OneTimeLastLiveEnd, dropped.OneTimeLastLiveEnd, &adopted, &conflicted)
+	mergeRoomValue("one_time_pending_delete_at", &keep.OneTimePendingDeleteAt, dropped.OneTimePendingDeleteAt, &adopted, &conflicted)
+	mergeRoomValue("one_time_pending_delete_hours", &keep.OneTimePendingDeleteHours, dropped.OneTimePendingDeleteHours, &adopted, &conflicted)
+	mergeRoomValue("one_time_delete_link_days", &keep.OneTimeDeleteLinkDays, dropped.OneTimeDeleteLinkDays, &adopted, &conflicted)
+	// 【D17】录制时间段配置是含切片的 struct，不能整值比较（无法用于 mergeRoomValue 的 comparable 约束），
+	// 单独按 Enable 作为"这条写法配置过"的标志合并，且必须深拷贝 Slots，避免合并后两条配置共享底层数组。
+	mergeRoomRecordSchedule(&keep.RecordSchedule, dropped.RecordSchedule, &adopted, &conflicted)
 	return adopted, conflicted
+}
+
+// mergeRoomRecordSchedule 合并重复条目的录制时间段配置（需求6 / D17）。
+// 先条未启用（Enable=false，视为"这条写法没配置时间段"）时采用后条的值并深拷贝时间段切片；
+// 两边都启用且内容不同时只能保住先条，记为冲突。
+func mergeRoomRecordSchedule(dst *RecordSchedule, src RecordSchedule, adopted, conflicted *[]string) {
+	switch {
+	case !dst.Enable && src.Enable:
+		cp := src
+		cp.Slots = cloneRecordTimeSlots(src.Slots)
+		*dst = cp
+		*adopted = append(*adopted, "record_schedule")
+	case dst.Enable && src.Enable && !recordScheduleEqual(*dst, src):
+		*conflicted = append(*conflicted, "record_schedule")
+	}
+}
+
+// recordScheduleEqual 判断两份录制时间段配置是否等价，仅用于重复条目合并时的冲突提示。
+func recordScheduleEqual(a, b RecordSchedule) bool {
+	if a.Enable != b.Enable || a.TemplateName != b.TemplateName || len(a.Slots) != len(b.Slots) {
+		return false
+	}
+	for i := range a.Slots {
+		if a.Slots[i].Start != b.Slots[i].Start || a.Slots[i].End != b.Slots[i].End {
+			return false
+		}
+		if len(a.Slots[i].Days) != len(b.Slots[i].Days) {
+			return false
+		}
+		for j := range a.Slots[i].Days {
+			if a.Slots[i].Days[j] != b.Slots[i].Days[j] {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // mergeRoomValue 保留条目该字段为未设置（零值）时采用丢弃条目的值；两边都设置且不同记为冲突。

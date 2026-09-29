@@ -17,6 +17,7 @@ import (
 	"github.com/bluenviron/mediacommon/v2/pkg/codecs/h265"
 
 	"github.com/bililive-go/bililive-go/src/pkg/livelogger"
+	"github.com/bililive-go/bililive-go/src/pkg/pause"
 	"github.com/bililive-go/bililive-go/src/pkg/proxy"
 )
 
@@ -431,6 +432,12 @@ func parseFirstSegmentURL(content string, baseURL *url.URL) (string, error) {
 
 // downloadSegmentHeader 下载 TS 分段的头部数据
 func downloadSegmentHeader(ctx context.Context, segmentURL string, headers map[string]string, maxBytes int) ([]byte, error) {
+	// 需求8（软重启）：探测自建的 client 不受传输层包装约束，发请求前先判定闸门。
+	// TS 分段与 fMP4 init 段都走本函数，一处即可覆盖两条路径。
+	if pause.Default().IsPaused() {
+		return nil, errSoftRestartPaused
+	}
+
 	transport := &http.Transport{
 		DialContext: (&net.Dialer{
 			Timeout:   10 * time.Second,
@@ -808,6 +815,12 @@ func extractNALUnits(data []byte) [][]byte {
 // ProbeHLS 独立的 HLS 流探测函数（不经过 StreamProbe 代理）
 // 流程：下载 m3u8 → 解析第一个 TS 分段 URL → 下载 TS 头部 → 解析 SPS
 func ProbeHLS(ctx context.Context, m3u8URL *url.URL, headers map[string]string, logger *livelogger.LiveLogger) (*StreamHeaderInfo, error) {
+	// 需求8（软重启）：本函数会立刻下载 m3u8，而它用的 client 是自己新建的，
+	// 不经 BaseLive.RequestSession，故必须在最前面判定闸门，暂停期间一个请求都不发。
+	if pause.Default().IsPaused() {
+		return nil, errSoftRestartPaused
+	}
+
 	if logger != nil {
 		// 只打印 header 键名列表，避免泄露 Cookie/Authorization 等敏感信息到日志
 		headerKeys := make([]string, 0, len(headers))

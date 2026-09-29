@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -13,9 +14,11 @@ import (
 	"github.com/bililive-go/bililive-go/src/configs"
 	"github.com/bililive-go/bililive-go/src/instance"
 	"github.com/bililive-go/bililive-go/src/live"
+	"github.com/bililive-go/bililive-go/src/livestate"
 	"github.com/bililive-go/bililive-go/src/recorders"
 	applog "github.com/bililive-go/bililive-go/src/log"
 	"github.com/bililive-go/bililive-go/src/pkg/foldersize"
+	"github.com/bililive-go/bililive-go/src/pkg/timeslot"
 	"github.com/bililive-go/bililive-go/src/pkg/utils"
 	"github.com/bililive-go/bililive-go/src/types"
 )
@@ -138,7 +141,28 @@ func batchOperationHandler(writer http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		// 【D11b】"转为持久性"前处于不录制状态（待删除 / 仅提醒）的房间，事务提交后需要补建录制器
+		var promoteIDs []string
 		_, err := configs.UpdateWithRetry(func(c *configs.Config) error {
+			// mutator 可能因版本冲突被重试执行多次，收集切片必须重置，避免回执重复
+			results = results[:0]
+			promoteIDs = promoteIDs[:0]
+
+			// 【D5】校验必须在任何写入之前完成，且校验失败整批不落盘：
+			//   - 非法时间 / 跨天时段落盘后，下次启动 Config.Verify 失败 → os.Exit(1)，容器反复重启；
+			//   - 悬空模板名会让 ResolveRecordSlots 返回 nil，录制被静默放行（前端还显示未启用）。
+			if action == "set_schedule" {
+				for _, id := range req.IDs {
+					room := findRoomByAnyID(c, id)
+					if room == nil {
+						continue
+					}
+					if verr := validateRoomRecordSchedule(c, room.Url, *schedule); verr != nil {
+						return newInvalidConfigError("%v", verr)
+					}
+				}
+			}
+
 			for _, id := range req.IDs {
 				room := findRoomByAnyID(c, id)
 				if room == nil {
@@ -149,44 +173,62 @@ func batchOperationHandler(writer http.ResponseWriter, r *http.Request) {
 				case "set_one_time":
 					configs.ApplyOneTimeFlag(room, true)
 				case "set_persistent":
+					// 【D11b】待删除 / 仅提醒期间是"只提醒不录制"，转为持久性后必须立即补建录制器，
+					// 否则要等到下一次开播才真正开录（单房间编辑路径就是这么补的）。
+					if room.IsListening && (room.IsPendingDelete() || room.NotifyOnly) {
+						promoteIDs = append(promoteIDs, id)
+					}
 					configs.ApplyOneTimeFlag(room, false)
 				case "set_schedule":
-					room.RecordSchedule = *schedule
+					// 深拷贝时间段切片再赋值：配置走"复制-修改-原子替换"，与请求体共享底层数组
+					// 会让旧快照被静默改写（Days 是内层切片，必须一并拷贝）。
+					applied := *schedule
+					applied.Slots = cloneTimeSlots(applied.Slots)
+					room.RecordSchedule = applied
 				}
 				results = append(results, batchOperationResult{ID: id, Success: true})
 			}
 			return nil
 		}, 3, 10*time.Millisecond)
 		if err != nil {
-			writeJsonWithStatusCode(writer, http.StatusInternalServerError, commonResp{
-				ErrNo:  http.StatusInternalServerError,
-				ErrMsg: "批量更新配置失败: " + err.Error(),
+			status := http.StatusInternalServerError
+			msg := "批量更新配置失败: " + err.Error()
+			if isInvalidConfigError(err) {
+				status = http.StatusBadRequest
+				msg = err.Error()
+			}
+			writeJsonWithStatusCode(writer, status, commonResp{
+				ErrNo:  status,
+				ErrMsg: msg,
 			})
 			return
 		}
 
+		// 事务提交之后再动运行时：正在直播且此前不录制的房间，转为持久性后立即补录
+		for _, id := range promoteIDs {
+			if liveObj, ok := findLiveByAnyID(inst, id); ok {
+				autoStartRecordingIfLive(inst, liveObj, "转为持久性录制")
+			}
+		}
+
 	case "start", "stop":
 		listen := req.Action == "start"
-		// 先落配置（is_listening），再操作运行时 listener
-		_, err := configs.UpdateWithRetry(func(c *configs.Config) error {
-			for _, id := range req.IDs {
-				if room := findRoomByAnyID(c, id); room != nil {
-					room.IsListening = listen
-				}
-			}
-			return nil
-		}, 3, 10*time.Millisecond)
-		if err != nil {
-			writeJsonWithStatusCode(writer, http.StatusInternalServerError, commonResp{
-				ErrNo:  http.StatusInternalServerError,
-				ErrMsg: "批量更新监听状态失败: " + err.Error(),
-			})
-			return
-		}
+		// 【D11c】顺序与单条（parseLiveAction）保持一致：先操作运行时，再落 is_listening 配置。
+		// 反过来的话，运行时失败时磁盘上已经是 is_listening=true，必须重启才能纠正；
+		// 单条失败只回执该条，不影响其它条目。
+		//
+		// 运行态没有该直播间（例如启动时初始化失败）时无运行时操作可做，仍沿用批量的既有能力：只同步配置。
+		var succeeded []string
 		for _, id := range req.IDs {
 			liveObj, ok := findLiveByAnyID(inst, id)
 			if !ok {
-				results = append(results, batchOperationResult{ID: id, Message: "未找到运行中的直播间"})
+				room := findRoomByAnyID(configs.GetCurrentConfig(), id)
+				if room == nil {
+					results = append(results, batchOperationResult{ID: id, Message: "未找到直播间"})
+					continue
+				}
+				succeeded = append(succeeded, room.Url)
+				results = append(results, batchOperationResult{ID: id, Success: true})
 				continue
 			}
 			var opErr error
@@ -199,10 +241,39 @@ func batchOperationHandler(writer http.ResponseWriter, r *http.Request) {
 				results = append(results, batchOperationResult{ID: id, Message: opErr.Error()})
 				continue
 			}
-			GetSSEHub().BroadcastListChange(liveObj.GetLiveId(), "listen_start", map[string]interface{}{
+			// 【D11a】stop 与单条保持一致：记录用户停止监控，结束 live_sessions 中仍开放的会话
+			if !listen {
+				if manager, mok := inst.LiveStateManager.(*livestate.Manager); mok && manager != nil {
+					manager.OnUserStopMonitoring(string(liveObj.GetLiveId()))
+				}
+			}
+			// 【D12】stop 必须广播 listen_stop（原实现无论开关都广播 listen_start）
+			event := "listen_start"
+			if !listen {
+				event = "listen_stop"
+			}
+			GetSSEHub().BroadcastListChange(liveObj.GetLiveId(), event, map[string]interface{}{
 				"live_id": string(liveObj.GetLiveId()),
 			})
+			succeeded = append(succeeded, liveObj.GetRawUrl())
 			results = append(results, batchOperationResult{ID: id, Success: true})
+		}
+		// 运行时全部处理完之后再一次性落盘：既保证"先运行时后配置"的顺序，又避免 N 次写盘
+		if len(succeeded) > 0 {
+			if _, cerr := configs.UpdateWithRetry(func(c *configs.Config) error {
+				for _, u := range succeeded {
+					if room, rerr := c.GetLiveRoomByUrl(u); rerr == nil {
+						room.IsListening = listen
+					}
+				}
+				return nil
+			}, 3, 10*time.Millisecond); cerr != nil {
+				writeJsonWithStatusCode(writer, http.StatusInternalServerError, commonResp{
+					ErrNo:  http.StatusInternalServerError,
+					ErrMsg: "批量更新监听状态失败: " + cerr.Error(),
+				})
+				return
+			}
 		}
 
 	case "delete":
@@ -228,6 +299,68 @@ func batchOperationHandler(writer http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(writer, commonResp{Data: results})
+}
+
+// ============================================================================
+// 需求6 / D5：录制时间段写入前的准入校验
+// ============================================================================
+
+// validateRoomRecordSchedule 校验即将写入某个直播间的录制时间段配置（需求6）。
+//
+// 为什么必须在 API 写入点做：校验原本只存在于 Config.Verify（启动与 PATCH /api/config），
+// 而批量 set_schedule、单房间更新、设置明文页都会直接写盘，于是：
+//   - 非法时间 / 跨天时段落盘后，下次启动 Verify 失败 → os.Exit(1)，容器反复重启；
+//   - 模板名不存在时 ResolveRecordSlots 返回 nil，录制被静默放行（全天可录）且没有任何日志。
+//
+// 口径与 Config.validateRecordSchedules 一致，并额外堵住"启用了但解析不出任何时段"的静默全天可录。
+// owner 仅用于拼装错误信息。
+func validateRoomRecordSchedule(c *configs.Config, roomURL string, sched configs.RecordSchedule) error {
+	if !sched.Enable {
+		// 未启用时间段时不限制录制：字段里残留的草稿不生效，不做拒绝（允许用户先填后启用）
+		return nil
+	}
+	if c == nil {
+		return fmt.Errorf("配置尚未加载")
+	}
+	if name := strings.TrimSpace(sched.TemplateName); name != "" {
+		// 必须与 ResolveRecordSlots 完全同口径地查模板：它拿 TrimSpace 后的模板名与模板的原始
+		// Name 精确比较。若这里改用 TrimSpace 后的模板名匹配（Verify 的做法），模板名带空格时
+		// 会出现"校验通过、运行时解析为空"的静默全天可录。
+		for i := range c.RecordScheduleTemplates {
+			if c.RecordScheduleTemplates[i].Name != name {
+				continue
+			}
+			slots := c.RecordScheduleTemplates[i].Slots
+			if len(slots) == 0 {
+				return fmt.Errorf("直播间 %s 引用的录制时间段模板 %q 里没有任何时间段", roomURL, name)
+			}
+			return timeslot.Validate(slots, fmt.Sprintf("录制时间段模板 %q", name))
+		}
+		return fmt.Errorf("直播间 %s 引用了不存在的录制时间段模板: %s", roomURL, name)
+	}
+	// 未引用模板：必须自带合法且非空的时间段，否则 timeslot.Compile 得到空窗口，
+	// 录制管理器把"没有时段限制"当成全天可录，前端却显示已启用。
+	if len(sched.Slots) == 0 {
+		return fmt.Errorf("直播间 %s 启用了录制时间段但没有配置任何时间段（也未引用模板），请至少添加一个时间段或指定模板，否则会全天录制", roomURL)
+	}
+	return timeslot.Validate(sched.Slots, "直播间 "+roomURL)
+}
+
+// cloneTimeSlots 深拷贝时间段切片（含 Days 内层切片），供 API 写入配置前隔离请求体与配置快照。
+// 配置采用"复制-修改-原子替换"提交，共享底层数组会让旧快照被静默改写。
+func cloneTimeSlots(src []timeslot.TimeSlot) []timeslot.TimeSlot {
+	if src == nil {
+		return nil
+	}
+	dst := make([]timeslot.TimeSlot, len(src))
+	for i, s := range src {
+		dst[i] = s
+		if s.Days != nil {
+			dst[i].Days = make([]int, len(s.Days))
+			copy(dst[i].Days, s.Days)
+		}
+	}
+	return dst
 }
 
 // ============================================================================

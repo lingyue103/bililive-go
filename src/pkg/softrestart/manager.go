@@ -16,6 +16,7 @@ package softrestart
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -32,6 +33,12 @@ import (
 const (
 	// scheduleCheckInterval 计划轮询间隔。计划精度只到分钟，30 秒足够及时。
 	scheduleCheckInterval = 30 * time.Second
+	// scheduleHitWindow 计划命中窗口宽度。
+	//
+	// 取 2 个轮询周期而不是 1 个：Ticker 丢一次 tick 或相位漂移时，
+	// 单周期窗口会让当天这条计划整天漏执行；配合"当天已执行"标记，
+	// 放宽到 2 个周期不会造成重复执行。
+	scheduleHitWindow = 2 * scheduleCheckInterval
 	// defaultRecoveryMinutes 配置缺省时的恢复时长
 	defaultRecoveryMinutes = 10
 )
@@ -48,6 +55,13 @@ type Manager struct {
 	// cancelCh 用于中止正在等待恢复窗口的软重启，让用户能手动提前恢复。
 	// 带 1 个缓冲，重复 Cancel 不会阻塞。
 	cancelCh chan struct{}
+
+	// scheduleMu 保护"当天该计划是否已执行"的标记。
+	// firedDate 记录标记所属日期，跨天时整表作废（无需额外的重置定时器）；
+	// fired 的键为 "计划时间"（HH:MM），值为空结构体。
+	scheduleMu sync.Mutex
+	firedDate  string
+	fired      map[string]struct{}
 }
 
 // NewManager 创建软重启管理器。gate 为 nil 时使用进程级默认闸门。
@@ -79,6 +93,12 @@ func (m *Manager) Close() {
 func (m *Manager) loop() {
 	ticker := time.NewTicker(scheduleCheckInterval)
 	defer ticker.Stop()
+
+	// 启动时立即补偿检查一次：进程在计划窗口内启动/重启时，
+	// 不必再等一个轮询周期（相位漂移时甚至可能整天错过）。
+	// 写法与 one_time_manager 的"启动即检查一次"一致。
+	m.tick()
+
 	for {
 		select {
 		case <-m.ctx.Done():
@@ -91,22 +111,48 @@ func (m *Manager) loop() {
 	}
 }
 
-// tick 检查当前是否命中某条计划，命中则触发软重启
+// tick 检查当前是否命中某条尚未执行的计划，命中则触发软重启
 func (m *Manager) tick() {
 	cfg := configs.GetCurrentConfig()
 	if cfg == nil || !cfg.AutoRestart.Enable {
 		return
 	}
+
+	// 已有软重启（手动触发或上一条计划）正在执行时，不消费本次计划窗口：
+	// hitSchedule 不会记录执行标记，等下一次 tick 再试，
+	// 避免计划在与手动 SoftRestartNow 撞车时被静默吞掉。
+	m.mu.Lock()
+	running := m.running
+	m.mu.Unlock()
+	if running {
+		return
+	}
+
 	if m.hitSchedule(cfg.AutoRestart.Schedules, time.Now()) {
 		go m.SoftRestartNow("定时计划触发")
 	}
 }
 
-// hitSchedule 判断 now 是否落在任一条计划的命中窗口内。
+// hitSchedule 判断 now 是否落在任一条计划尚未执行的命中窗口内。
 //
-// 用「[目标时刻, 目标时刻+轮询间隔)」作为命中窗口，而不是要求秒级精确相等 ——
-// 否则 30 秒轮询周期很容易整点错过。窗口内重复命中由 running 标志与闸门状态兜住。
+// 窗口取「[目标时刻, 目标时刻+2 个轮询周期)」，而不是要求秒级精确相等 ——
+// 30 秒轮询周期丢一次 tick 或相位漂移时，单周期窗口会整天漏执行。
+// 放宽窗口后，用"当天该计划是否已执行"的标记来保证不会重复触发；
+// 标记按日期作废，跨天自动重置。
 func (m *Manager) hitSchedule(schedules []configs.AutoRestartSchedule, now time.Time) bool {
+	day := now.Format("2006-01-02")
+
+	m.scheduleMu.Lock()
+	defer m.scheduleMu.Unlock()
+	if m.firedDate != day {
+		// 跨天：清空全部执行标记（含手动重启留下的无关状态）
+		m.firedDate = day
+		m.fired = make(map[string]struct{}, len(schedules))
+	}
+	if m.fired == nil {
+		m.fired = make(map[string]struct{}, len(schedules))
+	}
+
 	for i := range schedules {
 		sc := &schedules[i]
 		minutes, err := timeslot.ParseHHMM(sc.Time)
@@ -118,9 +164,16 @@ func (m *Manager) hitSchedule(schedules []configs.AutoRestartSchedule, now time.
 		}
 		target := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).
 			Add(time.Duration(minutes) * time.Minute)
-		if since := now.Sub(target); since >= 0 && since < scheduleCheckInterval {
-			return true
+		since := now.Sub(target)
+		if since < 0 || since >= scheduleHitWindow {
+			continue
 		}
+		// 该计划当天已执行过：不重复触发
+		if _, done := m.fired[sc.Time]; done {
+			continue
+		}
+		m.fired[sc.Time] = struct{}{}
+		return true
 	}
 	return false
 }
@@ -199,7 +252,10 @@ func (m *Manager) SoftRestartNow(reason string) {
 	//    （连接随之中断），而不仅仅是"不再发起新请求"。
 	m.gate.Pause(recovery, reason)
 
-	// 2) 停止所有录制器：断开设已建立的下载连接，否则流仍在被持续拉取
+	// 2) 停止所有录制器：断开设已建立的下载连接，否则流仍在被持续拉取。
+	//    快照必须在停止动作**之前**做：这批房间在恢复阶段要无条件补录 ——
+	//    已经开始的录制不应因为软重启（或期间抵达时段结束时刻）而丢失。
+	recordingBefore := m.snapshotRecordingLiveIDs()
 	stopped := m.stopAllRecorders()
 
 	// 3) 等待恢复时刻（可被 Close / 进程退出提前中断）
@@ -219,9 +275,9 @@ func (m *Manager) SoftRestartNow(reason string) {
 	m.gate.Resume()
 
 	// 5) 补录：见包注释 —— 暂停期间不会有 LiveStart 事件，必须主动补建录制器
-	resumed := m.resumeRecording()
+	resumed := m.resumeRecording(recordingBefore)
 
-	applog.GetLogger().Infof("软重启完成（%s）：已停止 %d 个录制器，恢复 %d 个仍在直播的房间", reason, stopped, resumed)
+	applog.GetLogger().Infof("软重启完成（%s）：已停止 %d 个录制器，恢复 %d 个房间的录制", reason, stopped, resumed)
 }
 
 // Cancel 立刻中止正在进行的软重启（提前恢复请求）。
@@ -243,6 +299,40 @@ func (m *Manager) Cancel() bool {
 	default: // 已有待处理的取消信号
 	}
 	return true
+}
+
+// snapshotRecordingLiveIDs 快照"当前正在录制"的直播间 ID 集合。
+//
+// 优先使用 RecorderManager 提供的只读快照接口（一次加锁读全量）；
+// 若实现未提供（例如测试里的假实现），回退到遍历 LiveMap + HasRecorder，
+// 结果语义完全一致，只是可能多几次加锁。
+func (m *Manager) snapshotRecordingLiveIDs() []types.LiveID {
+	inst := instance.GetInstance(m.ctx)
+	mgr, ok := inst.RecorderManager.(recorders.Manager)
+	if !ok || mgr == nil {
+		return nil
+	}
+
+	type recordingIDProvider interface {
+		RecordingLiveIDs() []string
+	}
+	if p, hasProvider := mgr.(recordingIDProvider); hasProvider {
+		raw := p.RecordingLiveIDs()
+		ids := make([]types.LiveID, 0, len(raw))
+		for _, s := range raw {
+			ids = append(ids, types.LiveID(s))
+		}
+		return ids
+	}
+
+	var ids []types.LiveID
+	inst.Lives.Range(func(id types.LiveID, _ live.Live) bool {
+		if mgr.HasRecorder(m.ctx, id) {
+			ids = append(ids, id)
+		}
+		return true
+	})
+	return ids
 }
 
 // stopAllRecorders 停止当前所有录制器，返回停止的数量。
@@ -272,8 +362,13 @@ func (m *Manager) stopAllRecorders() int {
 	return stopped
 }
 
-// resumeRecording 为"仍在直播且应当录制"的直播间补建录制器，返回补建数量。
-func (m *Manager) resumeRecording() int {
+// resumeRecording 补建录制器，返回补建数量。
+//
+// priority 是软重启开始前"正在录制"的直播间 ID 快照：这批房间**无条件先恢复**，
+// 不再跑 shouldRecord（时段/待删除/仅提醒只决定"是否开始录制"，
+// 而它们早已开始录制，不应因为软重启或期间到达时段结束时刻而整场丢失）。
+// 其余房间再按 shouldRecord 判定补录。
+func (m *Manager) resumeRecording(priority []types.LiveID) int {
 	inst := instance.GetInstance(m.ctx)
 	mgr, ok := inst.RecorderManager.(recorders.Manager)
 	if !ok || mgr == nil {
@@ -285,6 +380,33 @@ func (m *Manager) resumeRecording() int {
 	}
 
 	resumed := 0
+
+	// 1) 无条件恢复"软重启前正在录制"的房间。
+	//    仅保留一个必要前提：该房间在配置中仍然存在（否则不应再建录制器）。
+	for _, id := range priority {
+		// 已存在录制器（例如闸门恢复后 LiveStart 恰好抢先建好）时直接跳过
+		if mgr.HasRecorder(m.ctx, id) {
+			continue
+		}
+		l, found := inst.Lives.Get(id)
+		if !found || l == nil {
+			continue
+		}
+		if room, err := cfg.GetLiveRoomByUrl(l.GetRawUrl()); err != nil || room == nil {
+			continue
+		}
+		if err := mgr.AddRecorder(m.ctx, l); err != nil {
+			if errors.Is(err, recorders.ErrRecorderExist) {
+				continue
+			}
+			applog.GetLogger().Warnf("软重启恢复录制失败 %s: %v", l.GetRawUrl(), err)
+			continue
+		}
+		applog.GetLogger().Infof("软重启：已恢复软重启前正在录制的房间 %s", l.GetRawUrl())
+		resumed++
+	}
+
+	// 2) 其余房间按统一判定补录
 	inst.Lives.Range(func(id types.LiveID, l live.Live) bool {
 		if mgr.HasRecorder(m.ctx, id) {
 			return true
@@ -293,6 +415,10 @@ func (m *Manager) resumeRecording() int {
 			return true
 		}
 		if err := mgr.AddRecorder(m.ctx, l); err != nil {
+			// 闸门已放开，LiveStart 事件可能抢先建好录制器，这属于正常情况
+			if errors.Is(err, recorders.ErrRecorderExist) {
+				return true
+			}
 			applog.GetLogger().Warnf("软重启恢复录制失败 %s: %v", l.GetRawUrl(), err)
 			return true
 		}

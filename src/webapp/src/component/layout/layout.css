@@ -6,17 +6,37 @@
     padding: 24px;
 }
 
-@media(max-device-width: 768px) {
+/* 移动端断点：由 max-device-width 改为 max-width（视口宽度）。
+   原因：max-device-width 依据「设备屏幕宽度」，桌面浏览器把窗口拖到 600px 时它不会命中，
+   侧边栏会一直占着 200px、页面宽度被压缩；max-width 依据视口宽度，行为符合预期。
+   本文件里所有移动端规则只在窄屏视口下生效，桌面端（>768px）完全不受影响。
+   （live-list.css 里另有一份等价的 max-device-width 兜底，兼容老设备。） */
+@media (max-width: 768px) {
     .small-header{
         padding: 0 30px !important;
     }
     .side-bar {
         display: none;
     }
+    /* 窄屏把「内容区撑满剩余高度、滚动交给页面内的卡片列表」这条链逐级打通：
+       .all-layout / 内层 Layout 已经是 flex 纵向布局（antd Layout 自带），
+       这里只补齐 .content-padding 与 .inside-content-padding 的 flex:1 + min-height:0，
+       并禁止它们自己产生滚动条，避免出现「页面滚一层 + 列表内再滚一层」的双层滚动。
+       桌面端（>768px）不进入本媒体查询，排版与滚动行为完全不变。 */
     .content-padding {
         padding: 0px;
+        display: flex;
+        flex-direction: column;
+        flex: 1;
+        min-height: 0;
+        overflow: hidden;
     }
     .inside-content-padding {
         padding: 10px;
+        display: flex;
+        flex-direction: column;
+        flex: 1;
+        min-height: 0;
+        overflow: hidden;
     }
 }
