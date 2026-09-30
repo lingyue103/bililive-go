@@ -368,6 +368,18 @@
         font-size: 12px;
         line-height: 20px;
     }
+    /* 主播名称与直播间名称都被「列设置」关掉时显示的占位：
+       低亮度、斜体，明确是"被设置隐藏"而不是加载失败 */
+    .ll-card-name-hidden {
+        flex: 0 1 auto;
+        min-width: 0;
+        font-size: 13px;
+        font-style: italic;
+        color: rgba(0, 0, 0, 0.3);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
     /* 状态标签：允许换行，绝不省略（状态必须看全） */
     .ll-card-tags {
         display: flex;

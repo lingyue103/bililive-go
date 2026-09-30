@@ -1844,16 +1844,15 @@ class LiveList extends React.Component<Props, IState> {
     // 「直播间名称 / 直播平台」这两个 key 在窄屏下根本不存在：
     // 若面板仍展示它们，用户会把「主播名称 / 时间 / 大小 / 状态」全部取消、只留这两个不存在的列，
     // 结果列表只剩一个「操作」列，既无法辨认在操作谁、也无法自愈。
-    getAvailableSwitchableColumnKeys = (isSmall: boolean): string[] => {
-        if (!isSmall) {
-            return [...SWITCHABLE_COLUMN_KEYS];
-        }
-        const smallColumnKeys = this.smallColumns
-            .map((column: ColumnsType<ItemData>[number]) => String(column.key || ''))
-            // 「操作」列不属于可切换列，剔除掉
-            .filter((key: string) => !!key && key !== ALWAYS_VISIBLE_COLUMN_KEY);
-        // 仍按 SWITCHABLE_COLUMN_KEYS 的顺序输出，保证面板顺序在断点切换前后稳定
-        return SWITCHABLE_COLUMN_KEYS.filter(key => smallColumnKeys.includes(key));
+    // 两个断点（桌面表格 / 窄屏卡片列表）都返回全部 7 个可切换列。
+    //
+    // 这里曾经按断点分别计算：窄屏取 smallColumns 的 key 集合，于是「直播间名称 / 直播平台」
+    // 在手机上根本没有开关，而「主播名称 / 运行状态」虽然出现在面板里，卡片却把它们写死显示，
+    // 勾选/取消都没有任何效果 —— 用户看到的正是「列设置无效，勾选了也不显示」。
+    // 现在 renderMobileCard 会逐项遵循这些开关（含直播间名称与直播平台），
+    // 两个断点的可切换列集合因此完全一致，面板内容与显隐行为自然对齐。
+    getAvailableSwitchableColumnKeys = (): string[] => {
+        return [...SWITCHABLE_COLUMN_KEYS];
     };
 
     // 「当前断点下有效」的可见列 key：
@@ -1862,7 +1861,7 @@ class LiveList extends React.Component<Props, IState> {
     // 桌面端 available 就是全部 7 个 key，交集结果与 state.visibleColumnKeys 完全一致，
     // 因此桌面端的列显隐行为保持不变。
     getEffectiveVisibleColumnKeys = (): string[] => {
-        const available = this.getAvailableSwitchableColumnKeys(this.state.isSmall);
+        const available = this.getAvailableSwitchableColumnKeys();
         const effective = this.state.visibleColumnKeys.filter(key => available.includes(key));
         return effective.length > 0 ? effective : available;
     };
@@ -1871,7 +1870,7 @@ class LiveList extends React.Component<Props, IState> {
     // 这是「防止手机上只剩操作列」的第二道保险（第一道是 handleVisibleColumnsChange 的校验），
     // 用于纠正历史 localStorage 里已经存下的、在当前断点下无效的设置。
     ensureVisibleColumnKeysValid = () => {
-        const available = this.getAvailableSwitchableColumnKeys(this.state.isSmall);
+        const available = this.getAvailableSwitchableColumnKeys();
         const effective = this.state.visibleColumnKeys.filter(key => available.includes(key));
         if (effective.length === 0) {
             // 重置为全部可切换列（写入的是 7 个 key 的超集，另一个断点回到自己的界面时不会丢设置）
@@ -1894,7 +1893,7 @@ class LiveList extends React.Component<Props, IState> {
     // allowEmpty=true 表示调用方已经在界面上做过二次确认（如窄屏抽屉里的「关闭全部」），
     // 此时允许清空可切换列——「操作」列始终显示，列表不会因此不可用。
     handleVisibleColumnsChange = (checkedValues: any, allowEmpty: boolean = false) => {
-        const available = this.getAvailableSwitchableColumnKeys(this.state.isSmall);
+        const available = this.getAvailableSwitchableColumnKeys();
         // 只接受本断点真实存在的列 key，防御程序化传入的脏值
         const keys = (Array.isArray(checkedValues) ? checkedValues : [])
             .map((key: any) => String(key))
@@ -1929,7 +1928,7 @@ class LiveList extends React.Component<Props, IState> {
     // 说明：「操作」列不在面板里，它始终显示
     renderColumnSettingPanel = () => {
         // 面板只渲染「当前断点列集合里真实存在」的 key，理由见 getAvailableSwitchableColumnKeys
-        const available = this.getAvailableSwitchableColumnKeys(this.state.isSmall);
+        const available = this.getAvailableSwitchableColumnKeys();
         return (
         <div style={{ minWidth: 200 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
@@ -1948,7 +1947,7 @@ class LiveList extends React.Component<Props, IState> {
             </Checkbox.Group>
             <div style={{ color: '#999', fontSize: 12, marginTop: 8, paddingTop: 6, borderTop: '1px dashed #f0f0f0' }}>
                 {this.state.isSmall
-                    ? '窄屏使用卡片列表：「直播间名称 / 直播平台」固定显示在卡片副标题，无需开关；其余开关控制卡片上的信息行'
+                    ? '窄屏使用卡片列表：以上开关分别控制卡片上的主播名称 / 直播间名称 / 直播平台 / 状态标签 / 信息行'
                     : '「操作」列始终显示'}
             </div>
         </div>
@@ -2882,7 +2881,7 @@ class LiveList extends React.Component<Props, IState> {
     // getEffectiveVisibleColumnKeys / handleVisibleColumnsChange），
     // 因此窄屏与桌面端的列显隐是同一份设置，切换后互不打架。
     renderMobileColumnSheet = () => {
-        const available = this.getAvailableSwitchableColumnKeys(this.state.isSmall);
+        const available = this.getAvailableSwitchableColumnKeys();
         const effective = this.getEffectiveVisibleColumnKeys();
         const orderedKeys = available.slice().sort((a, b) => {
             const indexA = effective.indexOf(a);
@@ -2906,7 +2905,7 @@ class LiveList extends React.Component<Props, IState> {
                     );
                 })}
                 <div className="ll-sheet-note">
-                    窄屏使用卡片列表：「主播名称」固定显示，直播间名与直播平台固定显示在卡片副标题；其余开关控制卡片上的信息行。
+                    以下每一项都对应卡片上的实际内容：主播名称、直播间名称、直播平台、运行状态标签，以及添加时间 / 最近直播 / 文件夹大小三个信息行。「操作」按钮始终显示。
                 </div>
                 <div className="ll-sheet-actions">
                     <Button block size="middle" onClick={this.handleSelectAllColumns}>全部显示</Button>
@@ -3229,6 +3228,17 @@ class LiveList extends React.Component<Props, IState> {
         const isPendingDelete = record.oneTimeStatus === 'pending_delete';
         const inSelectMode = this.state.mobileSelecting || this.state.selectedRowKeys.length > 0;
 
+        // 卡片上的每一项都遵循「列设置」开关，用的就是桌面端那一份 key：
+        //   name=主播名称 / room=直播间名称 / address=直播平台 / tags=运行状态，
+        //   再加上 renderMobileCardMeta 负责的三个信息行（添加时间 / 最近直播 / 文件夹大小）。
+        // 「操作」不在开关范围内，始终显示（见 ALWAYS_VISIBLE_COLUMN_KEY），否则卡片无法操作。
+        const visibleKeys = this.getEffectiveVisibleColumnKeys();
+        const showName = visibleKeys.includes('name');
+        const showRoom = visibleKeys.includes('room');
+        const showPlatform = visibleKeys.includes('address');
+        const showTags = visibleKeys.includes('tags');
+        const hasLastError = !!record.room.lastError;
+
         const cardClass = [
             'll-card',
             selected ? 'll-card-selected' : '',
@@ -3250,38 +3260,51 @@ class LiveList extends React.Component<Props, IState> {
                                 />
                             </span>
                         )}
-                        <a
-                            className="ll-card-name"
-                            href={record.room.url}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            title={record.name}
-                            onClick={(e) => e.stopPropagation()}
-                        >
-                            {record.name}
-                        </a>
-                        {record.address && <Tag className="ll-card-platform">{record.address}</Tag>}
+                        {showName ? (
+                            <a
+                                className="ll-card-name"
+                                href={record.room.url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                title={record.name}
+                                onClick={(e) => e.stopPropagation()}
+                            >
+                                {record.name}
+                            </a>
+                        ) : (!showRoom && (
+                            // 主播名称与直播间名称都被列设置关掉时标题区会空掉，
+                            // 给一个低亮度占位，明确告诉用户这是「被设置隐藏」而不是数据没加载出来。
+                            // （列设置本身仍要求至少保留一列，不会出现完全无信息的卡片）
+                            <span className="ll-card-name-hidden">名称已隐藏</span>
+                        ))}
+                        {showPlatform && record.address && <Tag className="ll-card-platform">{record.address}</Tag>}
                     </div>
                 </div>
-                <div className="ll-card-tags">
-                    {this.renderStatusTags(record.tags)}
-                </div>
-                <div className="ll-card-sub">
-                    {record.room.lastError && (
-                        <Tooltip title={record.room.lastError}>
-                            <ExclamationCircleOutlined style={{ color: '#ff4d4f', marginRight: 4 }} />
-                        </Tooltip>
-                    )}
-                    <a
-                        className="ll-card-room"
-                        href={record.room.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        title={record.room.roomName}
-                    >
-                        {record.room.roomName}
-                    </a>
-                </div>
+                {showTags && (
+                    <div className="ll-card-tags">
+                        {this.renderStatusTags(record.tags)}
+                    </div>
+                )}
+                {(showRoom || hasLastError) && (
+                    <div className="ll-card-sub">
+                        {hasLastError && (
+                            <Tooltip title={record.room.lastError}>
+                                <ExclamationCircleOutlined style={{ color: '#ff4d4f', marginRight: 4 }} />
+                            </Tooltip>
+                        )}
+                        {showRoom && (
+                            <a
+                                className="ll-card-room"
+                                href={record.room.url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                title={record.room.roomName}
+                            >
+                                {record.room.roomName}
+                            </a>
+                        )}
+                    </div>
+                )}
                 {this.renderMobileCardMeta(record)}
                 {isPendingDelete && (
                     <div className="ll-card-alert">
