@@ -20,11 +20,13 @@ import (
 )
 
 const (
-	// recordScheduleCheckInterval 录制时间段补录检查周期。
+	// recordScheduleCheckInterval 录制时间段检查周期。
 	//
-	// LiveStart 回调只在开播那一刻判定一次录制时段，因此"开播在时段外、
-	// 之后才进入时段"的直播会整场漏录。这里以低频（约每分钟一次）补一次
-	// 与 LiveStart 完全相同的判定，避免整场丢失；不需要更密。
+	// LiveStart 回调只在开播那一刻判定一次录制时段，因此需要周期性兜住两个方向：
+	//  1) 开播在时段外、之后才进入时段 → 补建录制器，避免整场漏录；
+	//  2) 录制中到达时段的结束时刻 → 掐断录制（用户于 2026-09-30 变更的语义，
+	//     原先是"等它自然结束"）。
+	// 每分钟一次足够：方向 1 最多晚录 1 分钟，方向 2 最多多录 1 分钟。
 	recordScheduleCheckInterval = time.Minute
 )
 
@@ -130,13 +132,12 @@ func (m *manager) registryListener(ctx context.Context, ed events.Dispatcher) {
 				}
 				// 需求6：配置了录制时间段且当前不在时段内 → 只监控不录制。
 				//
-				// 注意本回调只在 LiveStart（开播）时触发，因此时间段仅决定"是否开始录制"；
-				// 已经开始的录制不会因为到达结束时刻而在中途被打断，会等它自然结束。
-				if slots := room.ResolveRecordSlots(cfg.RecordScheduleTemplates); len(slots) > 0 {
-					if !timeslot.IsActive(timeslot.Compile(slots), time.Now()) {
-						live.GetLogger().Info("当前不在配置的录制时间段内，仅监控不录制")
-						return
-					}
+				// 注意本回调只在 LiveStart（开播）时触发，因此这里只负责"要不要开始"；
+				// "到达结束时刻要掐断正在进行的录制"由 recordScheduleCatchUp 周期性地兜住
+				// （见 recordScheduleCheckInterval 的说明）。
+				if hasSlots, active := m.resolveRoomSchedule(cfg, room, time.Now()); hasSlots && !active {
+					live.GetLogger().Info("当前不在配置的录制时间段内，仅监控不录制")
+					return
 				}
 			}
 		}
@@ -150,6 +151,17 @@ func (m *manager) registryListener(ctx context.Context, ed events.Dispatcher) {
 		live := event.Object.(live.Live)
 		if !m.HasRecorder(ctx, live.GetLiveId()) {
 			return
+		}
+		// 需求6（2026-09-30 变更）：时间段已经结束的时刻，不能因为改名/分段策略
+		// （video_split_strategies.on_room_name_changed）把录制重新拉起来 ——
+		// 否则 recordScheduleCatchUp 掐断后，一次改名就会让它又录到下一个检查周期。
+		if cfg := configs.GetCurrentConfig(); cfg != nil {
+			if room, err := cfg.GetLiveRoomByUrl(live.GetRawUrl()); err == nil {
+				if hasSlots, active := m.resolveRoomSchedule(cfg, room, time.Now()); hasSlots && !active {
+					live.GetLogger().Info("已到达录制时间段的结束时刻，跳过改名/分段重启录制")
+					return
+				}
+			}
 		}
 		if err := m.RestartRecorder(ctx, live); err != nil {
 			live.GetLogger().Errorf("failed to cronRestart recorder, err: %v", err)
@@ -424,11 +436,33 @@ func (m *manager) startStatusBroadcaster(ctx context.Context) {
 	})
 }
 
-// recordScheduleCatchUp 为"开播时不在录制时段、之后才进入时段"的直播间补建录制器。
+// resolveRoomSchedule 解析直播间配置的录制时间段，并判断"此刻"是否落在时段内。
 //
-// LiveStart 回调（registryListener）只在开播那一刻判定一次时段，这类直播会整场漏录。
-// 这里的判定条件与 registryListener 完全一致，并且只对"当前没有录制器"的房间生效，
-// 真正的重复保护仍由 addRecorderLocked 在锁内完成（返回 ErrRecorderExist）。
+// 返回 hasSlots=false 表示该房间没有配置录制时间段（不受时间段约束，恒为可录）。
+// LiveStart 回调 / 改名重启 / 周期性检查三处共用这一份判定，避免出现
+// "某个入口漏判、把已掐断的录制又拉起来"的分歧。
+func (m *manager) resolveRoomSchedule(cfg *configs.Config, room *configs.LiveRoom, now time.Time) (hasSlots bool, active bool) {
+	if cfg == nil || room == nil {
+		return false, true
+	}
+	slots := room.ResolveRecordSlots(cfg.RecordScheduleTemplates)
+	if len(slots) == 0 {
+		return false, true
+	}
+	return true, timeslot.IsActive(timeslot.Compile(slots), now)
+}
+
+// recordScheduleCatchUp 周期性地把"录制时间段"落到实际录制行为上，两个方向都管：
+//
+//   - 时段开始：为"开播时不在时段、之后才进入时段"的直播间补建录制器
+//     （原先只做这件事，否则这类直播会整场漏录）；
+//   - 时段结束：**掐断正在进行的录制**（用户 2026-09-30 变更的语义，原先是"等它自然结束"）。
+//     RemoveRecorder 内部走 recorder.Close()，当前片段会正常收尾并进入转码/后处理，
+//     不会留下损坏文件；下一次进入时段时若仍在直播，本函数会再补建录制器继续录，
+//     因此同一直播被切成多段是预期行为。
+//
+// 判定条件与 registryListener 完全一致，真正的重复保护仍由 addRecorderLocked
+// 在锁内完成（返回 ErrRecorderExist）。
 func (m *manager) recordScheduleCatchUp(ctx context.Context) {
 	cfg := configs.GetCurrentConfig()
 	if cfg == nil {
@@ -440,6 +474,7 @@ func (m *manager) recordScheduleCatchUp(ctx context.Context) {
 	}
 	// 软重启切断流量期间不新建录制器：恢复阶段会统一补录，
 	// 此刻建出来的录制器也发不出任何请求，只会徒增状态抖动。
+	// 暂停期间同样不做掐断：软重启自己会停掉全部录制器，这里再动一次只会重复写日志。
 	if pause.Default().IsPaused() {
 		return
 	}
@@ -449,25 +484,38 @@ func (m *manager) recordScheduleCatchUp(ctx context.Context) {
 		if l == nil {
 			continue
 		}
-		if m.HasRecorder(ctx, id) {
-			continue
-		}
 		room, err := cfg.GetLiveRoomByUrl(l.GetRawUrl())
 		if err != nil || room == nil {
+			continue
+		}
+		// 只处理"配置了录制时段"的房间：未配时段的房间不受时间段约束。
+		hasSlots, active := m.resolveRoomSchedule(cfg, room, now)
+		if !hasSlots {
+			continue
+		}
+
+		// ---- 方向一：时段已结束 → 掐断正在进行的录制 ----
+		if !active {
+			if m.HasRecorder(ctx, id) {
+				if rerr := m.RemoveRecorder(ctx, id); rerr != nil {
+					// 并发下已被其它路径移除属于正常情况，不必刷错误日志
+					if !errors.Is(rerr, ErrRecorderNotExist) {
+						l.GetLogger().Warnf("录制时间段结束，停止录制失败: %v", rerr)
+					}
+				} else {
+					l.GetLogger().Info("已到达录制时间段的结束时刻，掐断本次录制（当前片段将正常收尾并转码）")
+				}
+			}
+			continue
+		}
+
+		// ---- 方向二：时段内 → 为漏录的房间补建录制器 ----
+		if m.HasRecorder(ctx, id) {
 			continue
 		}
 		// 与 registryListener 相同的跳过条件（IsListening 额外兜一道：
 		// 已停止监控的房间不应被周期性补录重新拉起）
 		if !room.IsListening || room.NotifyOnly || room.IsPendingDelete() {
-			continue
-		}
-		// 只处理"配置了录制时段"的房间：未配时段的房间在开播时已经建过录制器，
-		// 此处再判只会重复劳动（真正漏录的场景一定是时段判定导致的）。
-		slots := room.ResolveRecordSlots(cfg.RecordScheduleTemplates)
-		if len(slots) == 0 {
-			continue
-		}
-		if !timeslot.IsActive(timeslot.Compile(slots), now) {
 			continue
 		}
 		// 必须确实处于直播中（与软重启补录一样读监听缓存，不发起任何请求）

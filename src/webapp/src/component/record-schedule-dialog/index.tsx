@@ -339,8 +339,10 @@ export default function RecordScheduleDialog(props: RecordScheduleDialogProps): 
         <Text style={{ lineHeight: '24px' }}>启用录制时间段</Text>
       </div>
       <div style={{ marginTop: 6, marginLeft: 52, color: '#888', fontSize: 12, lineHeight: 1.7 }}>
-        开启后仅在下列时间段内<Text strong>开始</Text>录制；其他时间只监控不录制（状态显示“时段外仅监控”）。
-        <Text strong>正在进行的录制不会被中断</Text>，会等它自然结束。
+        开启后仅在下列时间段内录制；其他时间只监控不录制（状态显示“时段外仅监控”）。
+        <Text strong>到达时间段的结束时刻会掐断正在进行的录制</Text>
+        （当前片段会正常收尾并进入转码/后处理，不会损坏文件）；
+        下次进入时间段时如果还在直播，会自动继续录制。
       </div>
 
       <Divider style={{ margin: '12px 0' }} />
