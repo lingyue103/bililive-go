@@ -917,6 +917,9 @@ func addLiveImpl(ctx context.Context, urlStr string, isListen bool, notifyOnly b
 		}
 	}
 	inst := instance.GetInstance(ctx)
+	// 事务前取一次"此刻正在直播"的 URL 集合：把正在直播的房间设为一次性录制时，
+	// 「首次开播」已经发生，状态必须直接进入"一次性录制中"（详见 ApplyOneTimeFlag）。
+	oneTimeLiveURLs := recorders.LiveRoomURLs(ctx)
 	needAppend := false
 	liveRoom, err := configs.GetCurrentConfig().GetLiveRoomByUrl(u.String())
 	if err != nil {
@@ -927,16 +930,20 @@ func addLiveImpl(ctx context.Context, urlStr string, isListen bool, notifyOnly b
 			// 需求3：记录添加链接时间，供列表"添加链接时间"列展示
 			AddedAt: time.Now().Unix(),
 		}
-		// 需求1：按添加时勾选的"一次性录制"初始化状态机
-		configs.ApplyOneTimeFlag(liveRoom, isOneTime)
+		// 需求1：按添加时勾选的"一次性录制"初始化状态机。
+		// 注意：全新添加的链接此刻还没进入监听表，LiveRoomURLs 查不到它是正常的——
+		// 这种情况由"开播事件"或后台状态自愈（checkOnce）负责推进，不会卡死。
+		_, liveNow := oneTimeLiveURLs[u.String()]
+		configs.ApplyOneTimeFlag(liveRoom, isOneTime, liveNow)
 		needAppend = true
 	} else if isOneTime && !liveRoom.IsOneTime {
 		// 需求1：对已存在的链接再次添加时，允许通过"一次性录制"选项把它切换为一次性。
 		// 已进入 pending_delete 的房间不会被此处回退（ApplyOneTimeFlag 内部保证不可逆）。
 		existingURL := u.String()
+		_, liveNow := oneTimeLiveURLs[existingURL]
 		switchFn := func(c *configs.Config) error {
 			if room, e := c.GetLiveRoomByUrl(existingURL); e == nil {
-				configs.ApplyOneTimeFlag(room, true)
+				configs.ApplyOneTimeFlag(room, true, liveNow)
 			}
 			return nil
 		}
@@ -2561,6 +2568,9 @@ func updateRoomConfigById(writer http.ResponseWriter, r *http.Request) {
 	// 记录更新前的 NotifyOnly 状态，用于判断是否需要自动开始录制
 	var wasNotifyOnly bool
 	inst := instance.GetInstance(r.Context())
+	// 事务前取一次"此刻正在直播"的 URL 集合：把正在直播的房间改成一次性录制时，
+	// 「首次开播」已经发生，状态必须直接进入"一次性录制中"（详见 ApplyOneTimeFlag）。
+	oneTimeLiveURLs := recorders.LiveRoomURLs(r.Context())
 
 	_, err = configs.UpdateWithRetry(func(c *configs.Config) error {
 		// 查找直播间（先按 LiveId，回退按 URL 计算的 hash）
@@ -2637,7 +2647,10 @@ func updateRoomConfigById(writer http.ResponseWriter, r *http.Request) {
 
 		// 【需求1】一次性录制相关字段
 		if isOneTime, ok := updates["is_one_time"].(bool); ok {
-			configs.ApplyOneTimeFlag(room, isOneTime)
+			// 房间配置更新时同样要判断"此刻是否正在直播"：
+			// 正在直播的房间改为一次性录制，状态必须直接进入"一次性录制中"。
+			_, liveNow := oneTimeLiveURLs[room.Url]
+			configs.ApplyOneTimeFlag(room, isOneTime, liveNow)
 		}
 		if v, ok := updates["one_time_pending_delete_hours"].(float64); ok {
 			room.OneTimePendingDeleteHours = int(v)

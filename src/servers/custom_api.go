@@ -15,11 +15,11 @@ import (
 	"github.com/bililive-go/bililive-go/src/instance"
 	"github.com/bililive-go/bililive-go/src/live"
 	"github.com/bililive-go/bililive-go/src/livestate"
-	"github.com/bililive-go/bililive-go/src/recorders"
 	applog "github.com/bililive-go/bililive-go/src/log"
 	"github.com/bililive-go/bililive-go/src/pkg/foldersize"
 	"github.com/bililive-go/bililive-go/src/pkg/timeslot"
 	"github.com/bililive-go/bililive-go/src/pkg/utils"
+	"github.com/bililive-go/bililive-go/src/recorders"
 	"github.com/bililive-go/bililive-go/src/types"
 )
 
@@ -163,6 +163,10 @@ func batchOperationHandler(writer http.ResponseWriter, r *http.Request) {
 				}
 			}
 
+			// 事务前先取一次"此刻正在直播"的 URL 集合：批量把正在直播的房间设为一次性录制时，
+			// 「首次开播」其实已经发生，状态必须直接进入"一次性录制中"，
+			// 否则它会一直卡在"等待首次直播"，永远不会被标记待删除（详见 ApplyOneTimeFlag）。
+			liveURLs := recorders.LiveRoomURLs(inst.Ctx)
 			for _, id := range req.IDs {
 				room := findRoomByAnyID(c, id)
 				if room == nil {
@@ -171,14 +175,15 @@ func batchOperationHandler(writer http.ResponseWriter, r *http.Request) {
 				}
 				switch action {
 				case "set_one_time":
-					configs.ApplyOneTimeFlag(room, true)
+					_, liveNow := liveURLs[room.Url]
+					configs.ApplyOneTimeFlag(room, true, liveNow)
 				case "set_persistent":
 					// 【D11b】待删除 / 仅提醒期间是"只提醒不录制"，转为持久性后必须立即补建录制器，
 					// 否则要等到下一次开播才真正开录（单房间编辑路径就是这么补的）。
 					if room.IsListening && (room.IsPendingDelete() || room.NotifyOnly) {
 						promoteIDs = append(promoteIDs, id)
 					}
-					configs.ApplyOneTimeFlag(room, false)
+					configs.ApplyOneTimeFlag(room, false, false)
 				case "set_schedule":
 					// 深拷贝时间段切片再赋值：配置走"复制-修改-原子替换"，与请求体共享底层数组
 					// 会让旧快照被静默改写（Days 是内层切片，必须一并拷贝）。
@@ -396,6 +401,15 @@ func setOneTimeHandler(writer http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 事务前取一次"此刻正在直播"的 URL 集合（只读缓存，不发请求）。
+	// 对正在直播的房间设置"一次性录制"时，「首次开播」已经发生，
+	// 状态必须直接进入"一次性录制中"，否则会卡在"等待首次直播"永不推进。
+	instForCheck := instance.GetInstance(r.Context())
+	liveURLs := map[string]struct{}{}
+	if instForCheck != nil {
+		liveURLs = recorders.LiveRoomURLs(instForCheck.Ctx)
+	}
+
 	_, err := configs.UpdateWithRetry(func(c *configs.Config) error {
 		room := findRoomByAnyID(c, id)
 		if room == nil {
@@ -406,7 +420,8 @@ func setOneTimeHandler(writer http.ResponseWriter, r *http.Request) {
 			configs.ResetOneTimeState(room)
 			applog.GetLogger().Infof("一次性录制挽留：直播间 %s 已从待删除重置为一次性录制中", room.Url)
 		} else {
-			configs.ApplyOneTimeFlag(room, req.IsOneTime)
+			_, liveNow := liveURLs[room.Url]
+			configs.ApplyOneTimeFlag(room, req.IsOneTime, liveNow)
 		}
 		return nil
 	}, 3, 10*time.Millisecond)

@@ -1121,13 +1121,21 @@ func (l *LiveRoom) UnmarshalYAML(unmarshal func(any) error) error {
 
 // ApplyOneTimeFlag 设置/取消直播间的一次性录制标记（需求1）。
 //
+// liveNow 表示"该直播间此刻正在直播"。链接是在直播进行中添加/改为一次性时，
+// 「首次直播」其实已经发生——此时必须直接进入 recording 而不是 waiting_first_live：
+// waiting_first_live 的语义是"还没等到首次开播"，后台检查（checkOnce）会一直跳过它，
+// 于是这类链接永远不会被标记「待删除」、也永远不会被自动清理。
+// 传 false 时行为与旧版完全一致（新增链接进入 waiting_first_live，等待首次开播）。
+//
 // 开启时：
 //   - 若此前已进入 pending_delete（不可逆终态），保持不动 —— 必须由用户显式调用
 //     ResetOneTimeState 挽留，或转为持久性；
-//   - 其余情况置为 waiting_first_live（新增链接）或保持 recording（已有计时，不重开计时）。
+//   - 已在 recording（计时中）的保持不动，不重开计时；
+//   - liveNow=true → 直接置为 recording，且停播时间保持 0（倒计时从本场真正结束才开始）；
+//   - 其余情况置为 waiting_first_live，等待首次开播。
 //
 // 关闭时：清空一次性标记与全部相关状态/时间字段，转为持久性录制。
-func ApplyOneTimeFlag(room *LiveRoom, isOneTime bool) {
+func ApplyOneTimeFlag(room *LiveRoom, isOneTime bool, liveNow bool) {
 	if room == nil {
 		return
 	}
@@ -1145,6 +1153,13 @@ func ApplyOneTimeFlag(room *LiveRoom, isOneTime bool) {
 	}
 	// 已在计时中的直播间重复设置时不重置计时
 	if room.OneTimeStatus == OneTimeStatusRecording {
+		return
+	}
+	if liveNow {
+		// 本场直播正在进行：不需要再等"首次开播"，直接进入"一次性录制中"。
+		// 停播时间保持 0 —— 倒计时必须从本场真正结束（handleLiveEnd 写停播时间）才开始。
+		room.OneTimeStatus = OneTimeStatusRecording
+		room.OneTimeLastLiveEnd = 0
 		return
 	}
 	room.OneTimeStatus = OneTimeStatusWaitingFirstLive

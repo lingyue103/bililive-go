@@ -138,7 +138,14 @@ func (m *OneTimeManager) handleLiveStart(l live.Live) {
 		return
 	}
 	room, rerr := cfg.GetLiveRoomByUrl(rawURL)
-	if rerr != nil || room == nil || !room.IsOneTime {
+	if rerr != nil || room == nil {
+		// 这里绝不能静默返回：查不到配置会让"首次开播"这一步整体失效，
+		// 而房间看起来仍在正常录制（registryListener 在查不到配置时是"放行录制"的），
+		// 结果就是状态永远停在 waiting_first_live、且没有任何日志可查。
+		applog.GetLogger().Warnf("一次性录制：找不到直播间配置，跳过开播处理 url=%s err=%v", rawURL, rerr)
+		return
+	}
+	if !room.IsOneTime {
 		return
 	}
 	needStatus := room.OneTimeStatus == configs.OneTimeStatusWaitingFirstLive
@@ -179,7 +186,12 @@ func (m *OneTimeManager) handleLiveEnd(l live.Live) {
 		return
 	}
 	room, rerr := cfg.GetLiveRoomByUrl(rawURL)
-	if rerr != nil || room == nil || !room.IsOneTime {
+	if rerr != nil || room == nil {
+		// 同 handleLiveStart：停播时间写不进去会让倒计时永远不开始，必须留下痕迹。
+		applog.GetLogger().Warnf("一次性录制：找不到直播间配置，跳过停播处理 url=%s err=%v", rawURL, rerr)
+		return
+	}
+	if !room.IsOneTime {
 		return
 	}
 	if room.OneTimeStatus == configs.OneTimeStatusPendingDelete {
@@ -194,6 +206,14 @@ func (m *OneTimeManager) handleLiveEnd(l live.Live) {
 		// 已是终态则不再更新计时
 		if cur.OneTimeStatus == configs.OneTimeStatusPendingDelete {
 			return nil
+		}
+		// 兜底：有停播就说明本场开播确实发生过。状态若还停在 waiting_first_live
+		// （典型场景：链接是在直播进行中添加/改为一次性的，"首次开播"事件早已过去且不会再补发），
+		// 必须先提升为 recording —— 否则 checkOnce 会一直跳过它，
+		// 该链接永远不会进入"待删除"、也就永远不会被自动清理。
+		if cur.OneTimeStatus == configs.OneTimeStatusWaitingFirstLive {
+			cur.OneTimeStatus = configs.OneTimeStatusRecording
+			applog.GetLogger().Infof("一次性录制：%s 检测到停播但状态仍是「等待首次直播」，已修正为「一次性录制中」并开始计时", cur.Url)
 		}
 		cur.OneTimeLastLiveEnd = time.Now().Unix()
 		if cur.OneTimeStatus == "" {
@@ -213,15 +233,16 @@ type pendingDeletion struct {
 	rawURL string
 }
 
-// collectLiveRoomURLs 收集"当前正在直播"的房间原始 URL 集合。
+// LiveRoomURLs 收集"当前正在直播"的房间原始 URL 集合。
 //
 // 判定取两层依据的并集（任一成立即视为在播）：
 //   - 该 LiveId 上存在录制器（录制器只在直播中被创建）；
 //   - 监听器缓存里的 Info.Status 为 true（软重启暂停期间录制器被停掉，
 //     但缓存状态仍是"直播中"，这一层兜住）。
 //
-// 只读 inst.Lives / inst.Cache，不修改任何状态。
-func (m *OneTimeManager) collectLiveRoomURLs(ctx context.Context) map[string]struct{} {
+// 只读 inst.Lives / inst.Cache，不修改任何状态、不发起任何平台请求。
+// 导出给 API 入口共用：添加/改为一次性录制时需要判断"是不是正在直播"。
+func LiveRoomURLs(ctx context.Context) map[string]struct{} {
 	urls := make(map[string]struct{})
 	inst := instance.GetInstance(ctx)
 	if inst == nil {
@@ -249,6 +270,40 @@ func (m *OneTimeManager) collectLiveRoomURLs(ctx context.Context) map[string]str
 	return urls
 }
 
+// collectLiveRoomURLs 包装 LiveRoomURLs，保留包内既有的方法调用形式。
+func (m *OneTimeManager) collectLiveRoomURLs(ctx context.Context) map[string]struct{} {
+	return LiveRoomURLs(ctx)
+}
+
+// EverLiveRoomURLs 收集"曾经开播过"的房间原始 URL 集合。
+//
+// 依据是监听对象上的 LastStartTime（应用启动时会由 livestate 从数据库恢复，
+// 因此重启后依然有效）。用途：判断一个 waiting_first_live 的房间其实早已开播过 ——
+// 典型场景是链接在直播进行中添加/改为一次性，那一刻的 LiveStart 事件不会再补发，
+// 状态机就会永远停在"等待首次直播"（详见 checkOnce 的状态自愈）。
+//
+// 只读遍历，不发任何请求。
+func EverLiveRoomURLs(ctx context.Context) map[string]struct{} {
+	urls := make(map[string]struct{})
+	inst := instance.GetInstance(ctx)
+	if inst == nil {
+		return urls
+	}
+	inst.Lives.Range(func(_ types.LiveID, l live.Live) bool {
+		if l != nil && !l.GetLastStartTime().IsZero() {
+			urls[l.GetRawUrl()] = struct{}{}
+		}
+		return true
+	})
+	return urls
+}
+
+// OneTimeLiveNowURLs 已移除：设置一次性标记时只需要判断"此刻是否正在直播"
+// （见 LiveRoomURLs）；"曾经开播过"只用于状态自愈，且必须走 checkOnce 那条路径 ——
+// 只有在那里才能在提升状态的同时补上停播时间、真正启动倒计时。
+// 若在 API 入口把"曾经开播过"也当成 liveNow，会得到 recording + 停播时间 0 的组合，
+// 房间会在超时判定里被永久跳过。
+
 // oneTimeNeedsUpdate 在内存中判断是否存在需要写盘的一次性录制状态变化。
 //
 // 只读当前内存配置，不做任何写入。用于避免"没有任何变化也全量写盘"：
@@ -258,6 +313,7 @@ func oneTimeNeedsUpdate(
 	global configs.OneTimeRecordConfig,
 	now int64,
 	liveURLs map[string]struct{},
+	everLiveURLs map[string]struct{},
 ) bool {
 	if cfg == nil {
 		return false
@@ -268,6 +324,15 @@ func oneTimeNeedsUpdate(
 			continue
 		}
 		switch room.OneTimeStatus {
+		case configs.OneTimeStatusWaitingFirstLive:
+			// 需要自愈（见 checkOnce 的详细说明）：正在直播、曾经开播过、或已有停播时间时，
+			// 必须写盘把状态推进到 recording，否则这个房间会被永久跳过。
+			if _, live := liveURLs[room.Url]; live || room.OneTimeLastLiveEnd > 0 {
+				return true
+			}
+			if _, ever := everLiveURLs[room.Url]; ever {
+				return true
+			}
 		case configs.OneTimeStatusRecording:
 			if room.OneTimeLastLiveEnd <= 0 {
 				continue
@@ -308,29 +373,64 @@ func (m *OneTimeManager) checkOnce(ctx context.Context) {
 	// 正在直播的房间集合：上一场的停播计时若跨过本场直播，会在直播进行中
 	// 把房间误标为待删除（不可逆），因此这类房间必须排除在超时判定之外。
 	liveURLs := m.collectLiveRoomURLs(ctx)
+	// 曾经开播过的房间集合：仅用于"waiting_first_live 状态自愈"。
+	// 不能和 liveURLs 混用 —— 后者会把房间排除在超时判定之外，混用会让
+	// "曾经播过但早已停播"的房间永远不被标记待删除。
+	everLiveURLs := EverLiveRoomURLs(ctx)
 
 	// 先在内存中比对是否真的有字段变化（OneTimeStatus / OneTimeLastLiveEnd /
 	// OneTimePendingDeleteAt）。没有任何变化就直接返回，完全不落盘 ——
 	// 否则每 5 分钟一次的全量写盘在磁盘写失败（例如磁盘已满）时会白白刷错误日志，
 	// 甚至拖慢 handleLiveStart/handleLiveEnd 真正需要落盘的状态变更。
-	if !oneTimeNeedsUpdate(cfg, global, now, liveURLs) {
+	if !oneTimeNeedsUpdate(cfg, global, now, liveURLs, everLiveURLs) {
 		return
 	}
 
 	var (
 		newlyPending []string
 		toDelete     []pendingDeletion
+		healed       []string
 	)
 
 	_, err := configs.UpdateWithRetry(func(c *configs.Config) error {
 		// mutator 可能被重试执行多次，必须重置收集切片
 		newlyPending = newlyPending[:0]
 		toDelete = toDelete[:0]
+		healed = healed[:0]
 
 		for i := range c.LiveRooms {
 			room := &c.LiveRooms[i]
 			if !room.IsOneTime {
 				continue
+			}
+			// 状态自愈：waiting_first_live 的语义是"还没等到首次开播"，
+			// 但下面两种情况其实已经开播过了，必须提升为 recording：
+			//   1) 链接是在直播进行中添加/改为一次性的 —— 那一刻的 LiveStart
+			//      早已发生且不会再补发，状态机就永远等不到"首次开播"；
+			//   2) 已经记录到过停播时间（有停播必有开播）。
+			// 不修正的话下面的 switch 会直接 continue 跳过它，
+			// 结果是该链接永远不会被标记"待删除"、也永远不会被自动清理。
+			if room.OneTimeStatus == configs.OneTimeStatusWaitingFirstLive {
+				_, live := liveURLs[room.Url]
+				_, everLive := everLiveURLs[room.Url]
+				switch {
+				case live:
+					// 正在直播：本次直播还没结束，停播时间保持 0，
+					// 倒计时交给 handleLiveEnd（本场真正结束时才开始）。
+					room.OneTimeStatus = configs.OneTimeStatusRecording
+					healed = append(healed, room.Url)
+				case room.OneTimeLastLiveEnd > 0 || everLive:
+					// 已经播过（且当前不在直播）或已有停播时间：补上停播时间并开始倒计时，
+					// 否则这个房间会永远停在"等待首次直播"、链接永远不会被清理。
+					room.OneTimeStatus = configs.OneTimeStatusRecording
+					if room.OneTimeLastLiveEnd <= 0 {
+						room.OneTimeLastLiveEnd = now
+					}
+					healed = append(healed, room.Url)
+				default:
+					// 确实从未开播：按用户确认的规则，不进入待删除，一直等待首次直播
+					continue
+				}
 			}
 			switch room.OneTimeStatus {
 			case configs.OneTimeStatusWaitingFirstLive:
@@ -392,6 +492,10 @@ func (m *OneTimeManager) checkOnce(ctx context.Context) {
 	if err != nil {
 		applog.GetLogger().Warnf("一次性录制后台检查失败: %v", err)
 		return
+	}
+
+	for _, url := range healed {
+		applog.GetLogger().Infof("一次性录制：%s 状态自愈为「一次性录制中」（此前卡在「等待首次直播」但实际已开播过），倒计时将按其停播时间计算", url)
 	}
 
 	for _, url := range newlyPending {
