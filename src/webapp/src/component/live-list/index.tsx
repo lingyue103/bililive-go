@@ -545,6 +545,19 @@ interface ItemData {
     folderSize: number // 需求3：文件夹大小（字节，仅用于排序）
     folderSizeHuman: string // 需求3：文件夹大小（人类可读，如 "12.4 GB"）
     oneTimeStatus: string // 需求1：一次性录制状态，'' | waiting_first_live | recording | pending_delete
+    // ---- 需求1：一次性录制的时间线（后端按"生效阈值 + 状态"推导，用于显示"还有多久"）----
+    oneTimePendingDeleteHours: number // 生效的"未开播阈值"小时数（含房间级覆盖）
+    oneTimeDeleteLinkDays: number // 生效的"删链接延迟"天数
+    oneTimeLastLiveEnd: number // 最近一次停播（unix 秒，0=尚无停播记录）
+    oneTimePendingDeleteAt: number // 实际进入"待删除"的时刻（unix 秒）
+    oneTimeMarkDeleteAt: number // 预计进入"待删除"的时刻（unix 秒）
+    oneTimeDeleteAt: number // 预计删除链接的时刻（unix 秒）
+    oneTimeRemainingSeconds: number // 距离下一个节点的剩余秒数（0=无法推算）
+    oneTimeNextStage: string // 'mark_delete' | 'delete'
+    // ---- 运行状态排序用的结构化字段（排序不再依赖标签文本，避免文案变化导致排序失效）----
+    recording: boolean
+    recordingPreparing: boolean
+    initializing: boolean
     scheduleEnabled: boolean // 需求6：是否配置了录制时间段
     scheduleActive: boolean // 需求6：当前是否处于录制时段内
 }
@@ -629,15 +642,51 @@ class LiveList extends React.Component<Props, IState> {
     // 目的是让桌面端 Table 与移动端卡片列表共用同一套状态标签颜色、同一套操作菜单，
     // 抽出前后逻辑逐行一致，桌面端渲染结果不变（只是调用点换成了方法调用）。
 
-    // 录制优先级：数字越大越需要用户关注（待删除 > 一次性/等待首次直播 > 录制中 > 录制准备中 > 其他）。
-    // 桌面端「运行状态」列的 sorter 用它，移动端卡片列表的默认排序也用它
-    // ——卡片列表没有表头排序入口，若不排序，「待删除」的挽留入口会被埋在 200 多张卡片中间。
-    getRecordingPriority = (tags: string[]): number => {
-        if (tags.includes('待删除')) return 4;
-        if (tags.includes('一次性录制中') || tags.includes('等待首次直播')) return 3;
-        if (tags.includes('录制中')) return 2;
-        if (tags.includes('录制准备中')) return 1;
-        return 0;
+    // 运行状态的排序档位（数值越小越靠前）。用户选定顺序：
+    //   录制中 > 待删除 > 直播中未录制 > 录制准备中 > 初始化中
+    //   > 一次性录制中(未在播) > 等待首次开播 > 监控中(未在播) > 已停止
+    //
+    // 为什么改掉原来的实现：原先只用「标签文本 + 5 档」判优先级，实测 242 个房间里
+    // 有 205 个（84.7%）落在同一档，档内没有任何规则，先后顺序完全取决于接口返回顺序
+    // —— 这就是"正序倒序看着都乱"的根因。现在改为读结构化字段，且同档内再加确定性次级键。
+    // 顺带修掉"用标签文案判断状态"的脆弱性：以后改标签文字不会再影响排序。
+    getStatusRank = (record: ItemData): number => {
+        if (record.recording) return 0; // 录制中（最需要第一眼看到）
+        if (record.oneTimeStatus === 'pending_delete') return 1; // 待删除（不可逆，需挽留/转永久）
+        if (record.isLive) return 2; // 直播中但没在录（仅提醒 / 时段外 / 取流失败）
+        if (record.recordingPreparing) return 3; // 录制准备中（有录制器但还在重试取流）
+        if (record.initializing) return 4; // 初始化中
+        if (record.oneTimeStatus === 'recording') return 5; // 一次性录制中（已播过，停播计时）
+        if (record.oneTimeStatus === 'waiting_first_live') return 6; // 等待首次开播
+        if (record.listening) return 7; // 监控中（当前未在播）
+        return 8; // 已停止监控
+    };
+
+    // 同档内的确定性次级排序：
+    //   - 待删除：按"预计删除链接时间"升序 → 最快被删的排最上面（最该优先处理）
+    //   - 其余：最近直播时间降序 → 添加时间降序 → 名称升序
+    // 没有这一层，同档房间的先后会随接口返回顺序抖动，表现为"每次刷新顺序都不一样"。
+    compareByRunningStatus = (a: ItemData, b: ItemData): number => {
+        const rankA = this.getStatusRank(a);
+        const rankB = this.getStatusRank(b);
+        if (rankA !== rankB) {
+            return rankA - rankB;
+        }
+        if (rankA === 1) {
+            // 没有预计删除时间的排到最后（例如从未开播过、无法推算）
+            const delA = a.oneTimeDeleteAt > 0 ? a.oneTimeDeleteAt : Number.MAX_SAFE_INTEGER;
+            const delB = b.oneTimeDeleteAt > 0 ? b.oneTimeDeleteAt : Number.MAX_SAFE_INTEGER;
+            if (delA !== delB) {
+                return delA - delB;
+            }
+        }
+        if (a.lastStartTimeUnix !== b.lastStartTimeUnix) {
+            return b.lastStartTimeUnix - a.lastStartTimeUnix;
+        }
+        if (a.addedAt !== b.addedAt) {
+            return b.addedAt - a.addedAt;
+        }
+        return a.name.localeCompare(b.name);
     };
 
     // 运行状态标签渲染（颜色规则与原先「运行状态」列完全一致）。
@@ -757,13 +806,8 @@ class LiveList extends React.Component<Props, IState> {
         onFilter: (value: string | number | boolean, record: ItemData) => record.tags.includes(value as string),
         // 标签颜色规则抽到 renderStatusTags 里，供移动端卡片复用（渲染结果与原先完全一致）
         render: (tags: string[]) => this.renderStatusTags(tags),
-        sorter: (a: ItemData, b: ItemData) => {
-            // 待删除 > 一次性录制中/等待首次直播 > 录制中 > 录制准备中 > 其他
-            // 「待删除」优先级最高，提醒用户尽快处理（挽留或转为永久）
-            // 优先级计算抽到 getRecordingPriority，移动端卡片列表的默认排序复用同一套规则
-            return this.getRecordingPriority(a.tags) - this.getRecordingPriority(b.tags);
-        },
-        defaultSortOrder: 'descend',
+        sorter: this.compareByRunningStatus,
+        defaultSortOrder: 'ascend',
     };
 
     runAction: ColumnsType<ItemData>[number] = {
@@ -1703,6 +1747,19 @@ class LiveList extends React.Component<Props, IState> {
                         folderSizeHuman: item.folder_size_human || '',
                         // ---- 需求1/6：一次性录制与录制时间段状态 ----
                         oneTimeStatus: item.one_time_status || '',
+                        // 需求1：时间线字段（后端推导，前端只格式化）
+                        oneTimePendingDeleteHours: item.one_time_pending_delete_hours || 0,
+                        oneTimeDeleteLinkDays: item.one_time_delete_link_days || 0,
+                        oneTimeLastLiveEnd: item.one_time_last_live_end || 0,
+                        oneTimePendingDeleteAt: item.one_time_pending_delete_at || 0,
+                        oneTimeMarkDeleteAt: item.one_time_mark_delete_at || 0,
+                        oneTimeDeleteAt: item.one_time_delete_at || 0,
+                        oneTimeRemainingSeconds: item.one_time_remaining_seconds || 0,
+                        oneTimeNextStage: item.one_time_next_stage || '',
+                        // 运行状态排序用的结构化字段
+                        recording: item.recording === true,
+                        recordingPreparing: item.recording_preparing === true,
+                        initializing: item.initializing === true,
                         scheduleEnabled: item.schedule_enabled === true,
                         scheduleActive: item.schedule_active === true,
                     };
@@ -2460,7 +2517,9 @@ class LiveList extends React.Component<Props, IState> {
     // 窄屏排序：按 state.mobileSortKey 排序（默认运行状态/录制优先级倒序）
     sortMobileList = (list: ItemData[]): ItemData[] => {
         const comparators: { [key: string]: (a: ItemData, b: ItemData) => number } = {
-            priority: (a, b) => this.getRecordingPriority(b.tags) - this.getRecordingPriority(a.tags),
+            // 运行状态排序与桌面端「运行状态」列共用同一套档位与次级键（compareByRunningStatus），
+            // 保证两端的"最需要关注的排最上"口径完全一致
+            priority: this.compareByRunningStatus,
             // 时间/大小列与桌面端的 sorter 方向一致（桌面端点第一次是升序）
             addedAt: (a, b) => a.addedAt - b.addedAt,
             lastStartTimeUnix: (a, b) => a.lastStartTimeUnix - b.lastStartTimeUnix,
@@ -3468,6 +3527,94 @@ class LiveList extends React.Component<Props, IState> {
         </>
     );
 
+    // 需求1：一次性录制的状态与时间线（展开详情里显示）。
+    // 所有时间点都由后端按"生效阈值 + 状态"推导（one_time_* 字段），前端只做格式化，
+    // 与后台 checkOnce 的判定口径一致（标记待删除 = 最近停播 + 阈值小时；删链接 = 标记时刻 + 天数）。
+    renderOneTimeInfoBlock = (record: ItemData): JSX.Element | null => {
+        if (!record.oneTimeStatus) {
+            return null; // 非一次性录制不显示
+        }
+        const fmtTime = (ts: number): string => {
+            if (!ts || ts <= 0) return '—';
+            const d = new Date(ts * 1000);
+            const p = (n: number) => String(n).padStart(2, '0');
+            return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+        };
+        // 把"剩余秒数"变成"X 天 Y 小时"；0 表示无法推算（例如从未开播）
+        const fmtRemain = (sec: number): string => {
+            if (!sec) return '无法推算';
+            const past = sec < 0;
+            let s = Math.abs(sec);
+            const dd = Math.floor(s / 86400); s -= dd * 86400;
+            const hh = Math.floor(s / 3600); s -= hh * 3600;
+            const mm = Math.floor(s / 60);
+            const parts: string[] = [];
+            if (dd > 0) parts.push(`${dd} 天`);
+            if (hh > 0) parts.push(`${hh} 小时`);
+            if (dd === 0 && mm > 0) parts.push(`${mm} 分`);
+            if (parts.length === 0) parts.push('不到 1 分钟');
+            return (past ? '已超过 ' : '') + parts.join(' ');
+        };
+        const statusText = record.oneTimeStatus === 'pending_delete'
+            ? '待删除（不可逆：只提醒不录制）'
+            : record.oneTimeStatus === 'recording'
+                ? '一次性录制中（已播过，停播计时）'
+                : record.oneTimeStatus === 'waiting_first_live'
+                    ? '等待首次开播'
+                    : record.oneTimeStatus;
+        const isPending = record.oneTimeStatus === 'pending_delete';
+        const rows: [string, string][] = [
+            ['状态', statusText],
+            ['生效阈值', `${record.oneTimePendingDeleteHours} 小时内没再开播 → 标记待删除；再过 ${record.oneTimeDeleteLinkDays} 天删除链接`],
+            ['最近一次停播', fmtTime(record.oneTimeLastLiveEnd)],
+            ['预计进入待删除', isPending ? `${fmtTime(record.oneTimePendingDeleteAt)}（已进入）` : fmtTime(record.oneTimeMarkDeleteAt)],
+            ['预计删除链接', fmtTime(record.oneTimeDeleteAt)],
+        ];
+        if (record.oneTimeNextStage) {
+            rows.push([
+                record.oneTimeNextStage === 'delete' ? '距离删除链接' : '距离标记待删除',
+                fmtRemain(record.oneTimeRemainingSeconds),
+            ]);
+        }
+        return (
+            <div style={{
+                margin: 12,
+                padding: '10px 12px',
+                border: `1px solid ${isPending ? '#ffccc7' : '#f0f0f0'}`,
+                background: isPending ? '#fff2f0' : '#fafafa',
+                borderRadius: 6,
+            }}>
+                <div style={{ fontWeight: 600, marginBottom: 6, color: isPending ? '#cf1322' : '#1f1f1f' }}>
+                    一次性录制
+                </div>
+                {rows.map(([label, value]) => (
+                    <div key={label} style={{ display: 'flex', gap: 8, fontSize: 12, lineHeight: '20px' }}>
+                        <span style={{ width: 110, flexShrink: 0, color: '#8c8c8c' }}>{label}</span>
+                        <span style={{ color: label === '预计删除链接' && isPending ? '#cf1322' : 'inherit', wordBreak: 'break-all' }}>{value}</span>
+                    </div>
+                ))}
+                {(isPending || record.oneTimeStatus === 'recording') && (
+                    <div style={{ marginTop: 10, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                        <PopDialog
+                            title="确定将该直播间重置为一次性录制？"
+                            onConfirm={() => this.handleResetToOneTime(record.roomId)}>
+                            <Button size="small" style={{ backgroundColor: '#52c41a', borderColor: '#52c41a', color: '#fff' }}>
+                                重置为一次性
+                            </Button>
+                        </PopDialog>
+                        <PopDialog
+                            title="确定将该直播间转为永久录制？"
+                            onConfirm={() => this.handleConvertToPersistent(record.roomId)}>
+                            <Button size="small" style={{ backgroundColor: '#fa8c16', borderColor: '#fa8c16', color: '#fff' }}>
+                                转为永久
+                            </Button>
+                        </PopDialog>
+                    </div>
+                )}
+            </div>
+        );
+    };
+
     renderExpandedRow = (record: ItemData): JSX.Element => {
         const { expandedDetails, expandedLogs, countdownTimers, refreshStatus } = this.state;
         const detail = expandedDetails[record.roomId];
@@ -4008,6 +4155,8 @@ class LiveList extends React.Component<Props, IState> {
                 backgroundColor: '#fff',
                 boxShadow: '0 2px 8px rgba(0,0,0,0.06)'
             }}>
+                {/* 需求1：一次性录制的状态与时间线（非一次性录制时该函数返回 null） */}
+                {this.renderOneTimeInfoBlock(record)}
                 <Tabs
                     defaultActiveKey="runtime"
                     size="small"

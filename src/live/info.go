@@ -81,6 +81,23 @@ type Info struct {
 	OneTime bool
 	// OneTimeStatus 一次性录制状态：waiting_first_live / recording / pending_delete
 	OneTimeStatus string
+	// 以下时间信息由服务器按"生效阈值 + 状态"推导，供前端显示"当前处于什么阶段、还有多久"。
+	// OneTimePendingDeleteHours 生效的"未开播阈值"（小时，含房间级覆盖）
+	OneTimePendingDeleteHours int
+	// OneTimeDeleteLinkDays 生效的"删链接延迟"（天，含房间级覆盖）
+	OneTimeDeleteLinkDays int
+	// OneTimeLastLiveEnd 最近一次停播时间（unix 秒，0=尚无停播记录）
+	OneTimeLastLiveEnd int64
+	// OneTimePendingDeleteAt 实际进入"待删除"的时刻（unix 秒，0=尚未进入）
+	OneTimePendingDeleteAt int64
+	// OneTimeMarkDeleteAt 预计进入"待删除"的时刻（unix 秒，0=无法推算，例如从未开播）
+	OneTimeMarkDeleteAt int64
+	// OneTimeDeleteAt 预计删除链接的时刻（unix 秒，0=无法推算）
+	OneTimeDeleteAt int64
+	// OneTimeRemainingSeconds 距离下一个节点的剩余秒数（负数表示已过期，0 表示无法推算）
+	OneTimeRemainingSeconds int64
+	// OneTimeNextStage 下一个节点：mark_delete（即将标记待删除）/ delete（即将删链接）
+	OneTimeNextStage string
 
 	// ---------- 需求6：录制时间段 ----------
 	// ScheduleEnabled 是否配置并启用了录制时间段
@@ -122,6 +139,15 @@ func (i *Info) MarshalJSON() ([]byte, error) {
 		// ---------- 需求1 ----------
 		OneTime       bool   `json:"one_time,omitempty"`
 		OneTimeStatus string `json:"one_time_status,omitempty"`
+		// ---------- 需求1：一次性录制的时间线（前端据此显示"还有多久"）----------
+		OneTimePendingDeleteHours int    `json:"one_time_pending_delete_hours,omitempty"`
+		OneTimeDeleteLinkDays     int    `json:"one_time_delete_link_days,omitempty"`
+		OneTimeLastLiveEnd        int64  `json:"one_time_last_live_end,omitempty"`
+		OneTimePendingDeleteAt    int64  `json:"one_time_pending_delete_at,omitempty"`
+		OneTimeMarkDeleteAt       int64  `json:"one_time_mark_delete_at,omitempty"`
+		OneTimeDeleteAt           int64  `json:"one_time_delete_at,omitempty"`
+		OneTimeRemainingSeconds   int64  `json:"one_time_remaining_seconds,omitempty"`
+		OneTimeNextStage          string `json:"one_time_next_stage,omitempty"`
 		// ---------- 需求6 ----------
 		ScheduleEnabled bool `json:"schedule_enabled,omitempty"`
 		ScheduleActive  bool `json:"schedule_active,omitempty"`
@@ -147,6 +173,14 @@ func (i *Info) MarshalJSON() ([]byte, error) {
 		FolderSizeHuman:           i.FolderSizeHuman,
 		OneTime:                   i.OneTime,
 		OneTimeStatus:             i.OneTimeStatus,
+		OneTimePendingDeleteHours: i.OneTimePendingDeleteHours,
+		OneTimeDeleteLinkDays:     i.OneTimeDeleteLinkDays,
+		OneTimeLastLiveEnd:        i.OneTimeLastLiveEnd,
+		OneTimePendingDeleteAt:    i.OneTimePendingDeleteAt,
+		OneTimeMarkDeleteAt:       i.OneTimeMarkDeleteAt,
+		OneTimeDeleteAt:           i.OneTimeDeleteAt,
+		OneTimeRemainingSeconds:   i.OneTimeRemainingSeconds,
+		OneTimeNextStage:          i.OneTimeNextStage,
 		ScheduleEnabled:           i.ScheduleEnabled,
 		ScheduleActive:            i.ScheduleActive,
 	}

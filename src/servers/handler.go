@@ -105,6 +105,40 @@ func parseInfo(ctx context.Context, l live.Live) *live.Info {
 			info.NotifyOnly = room.NotifyOnly
 			info.OneTime = room.IsOneTime
 			info.OneTimeStatus = room.OneTimeStatus
+			// 需求1：一次性录制的时间线。全部由"生效阈值 + 状态 + 当前时间"推导，
+			// 与后台 checkOnce 的判定口径完全一致（标记时刻 = 最近停播 + 阈值小时；
+			// 删链接时刻 = 标记时刻 + 延迟天数），不产生任何额外平台请求。
+			if room.IsOneTime {
+				hours := room.EffectiveOneTimePendingDeleteHours(cfg.OneTimeRecord)
+				days := room.EffectiveOneTimeDeleteLinkDays(cfg.OneTimeRecord)
+				info.OneTimePendingDeleteHours = hours
+				info.OneTimeDeleteLinkDays = days
+				info.OneTimeLastLiveEnd = room.OneTimeLastLiveEnd
+				info.OneTimePendingDeleteAt = room.OneTimePendingDeleteAt
+				nowUnix := time.Now().Unix()
+				switch room.OneTimeStatus {
+				case configs.OneTimeStatusPendingDelete:
+					// 已进入不可逆的"待删除"：只剩"删链接"这一个节点
+					base := room.OneTimePendingDeleteAt
+					if base <= 0 {
+						base = nowUnix
+					}
+					info.OneTimeDeleteAt = base + int64(days)*86400
+					info.OneTimeMarkDeleteAt = base
+					info.OneTimeNextStage = "delete"
+					info.OneTimeRemainingSeconds = info.OneTimeDeleteAt - nowUnix
+				case configs.OneTimeStatusRecording:
+					// 停播计时中：有停播时间才能推算；last_live_end 为 0 表示本场还没结束
+					if room.OneTimeLastLiveEnd > 0 {
+						info.OneTimeMarkDeleteAt = room.OneTimeLastLiveEnd + int64(hours)*3600
+						info.OneTimeDeleteAt = info.OneTimeMarkDeleteAt + int64(days)*86400
+						info.OneTimeNextStage = "mark_delete"
+						info.OneTimeRemainingSeconds = info.OneTimeMarkDeleteAt - nowUnix
+					}
+				case configs.OneTimeStatusWaitingFirstLive:
+					// 从未开播过：没有任何时间点可推算，三个时间字段保持 0
+				}
+			}
 			// 需求6：配置了录制时间段时，实时计算当前是否处于时段内。
 			// 未配置（或引用的模板不存在导致解析为空）时 ScheduleEnabled 保持 false，
 			// 前端据此不显示"时段外仅监控"标签。
