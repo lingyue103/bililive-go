@@ -2601,6 +2601,9 @@ func updateRoomConfigById(writer http.ResponseWriter, r *http.Request) {
 
 	// 记录更新前的 NotifyOnly 状态，用于判断是否需要自动开始录制
 	var wasNotifyOnly bool
+	// 更新前的一次性录制状态：用于判断本次是否"从一次性/待删除恢复为可录制"，
+	// 若是且房间正在直播，必须在事务提交后立即补建录制器（否则会一直停在"监控中"）。
+	var wasOneTime, wasPendingDelete bool
 	inst := instance.GetInstance(r.Context())
 	// 事务前取一次"此刻正在直播"的 URL 集合：把正在直播的房间改成一次性录制时，
 	// 「首次开播」已经发生，状态必须直接进入"一次性录制中"（详见 ApplyOneTimeFlag）。
@@ -2681,6 +2684,9 @@ func updateRoomConfigById(writer http.ResponseWriter, r *http.Request) {
 
 		// 【需求1】一次性录制相关字段
 		if isOneTime, ok := updates["is_one_time"].(bool); ok {
+			// 记录更新前的值，供事务提交后判断"是否从一次性/待删除恢复为可录制"
+			wasOneTime = room.IsOneTime
+			wasPendingDelete = room.IsPendingDelete()
 			// 房间配置更新时同样要判断"此刻是否正在直播"：
 			// 正在直播的房间改为一次性录制，状态必须直接进入"一次性录制中"。
 			_, liveNow := oneTimeLiveURLs[room.Url]
@@ -2739,6 +2745,20 @@ func updateRoomConfigById(writer http.ResponseWriter, r *http.Request) {
 			if liveObj, ok := inst.Lives.Get(types.LiveID(liveId)); ok {
 				autoStartRecordingIfLive(inst, liveObj, "从仅提醒模式切换为普通模式")
 			}
+		}
+	}
+
+	// 【需求1】如果本次把"一次性录制"关掉（转为持久性），或房间原本处于"待删除"，
+	// 而它此刻正在直播，同样要立即补建录制器：
+	// 待删除期间是"只提醒不录制"，房间已在直播、不会再触发 LiveStart 事件，
+	// 不补建就会一直停在"监控中"直到下次重新开播（用户实测反馈的缺陷）。
+	if isOneTime, ok := updates["is_one_time"].(bool); ok && !isOneTime && wasOneTime {
+		if liveObj, ok := inst.Lives.Get(types.LiveID(liveId)); ok {
+			reason := "从一次性录制切换为持久性录制"
+			if wasPendingDelete {
+				reason = "从待删除恢复为持久性录制"
+			}
+			autoStartRecordingIfLive(inst, liveObj, reason)
 		}
 	}
 

@@ -440,20 +440,13 @@ func setOneTimeHandler(writer http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 挽留后若该直播间正在直播且尚未录制，立即补上录制器
-	// （待删除期间是"只提醒不录制"，重置后应恢复录制能力）
-	if req.Reset {
-		if obj, cerr := inst.Cache.Get(liveObj); cerr == nil && obj != nil {
-			if info, iok := obj.(*live.Info); iok && info.Status {
-				if mgr, mok := inst.RecorderManager.(recorders.Manager); mok {
-					if !mgr.HasRecorder(inst.Ctx, liveObj.GetLiveId()) {
-						if aerr := mgr.AddRecorder(inst.Ctx, liveObj); aerr != nil {
-							liveObj.GetLogger().Warnf("挽留后自动开始录制失败: %v", aerr)
-						}
-					}
-				}
-			}
-		}
+	// 挽留（reset）与"转为永久"（is_one_time=false）之后，若该直播间正在直播且尚未录制，
+	// 立即补上录制器：
+	//   - 待删除期间是"只提醒不录制"，挽留后应恢复录制能力；
+	//   - 转为永久同理 —— 房间此刻已在直播，**不会再触发 LiveStart 事件**，
+	//     不主动补建就会一直停在"监控中"直到下次重新开播（用户实测反馈的缺陷）。
+	if req.Reset || !req.IsOneTime {
+		autoStartRecordingIfLive(inst, liveObj, "挽留/转为持久性录制")
 	}
 
 	writeJSON(writer, commonResp{Data: parseInfo(r.Context(), liveObj)})

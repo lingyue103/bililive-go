@@ -20,13 +20,14 @@ import (
 )
 
 const (
-	// recordScheduleCheckInterval 录制时间段检查周期。
+	// recordScheduleCheckInterval 录制状态检查周期。
 	//
-	// LiveStart 回调只在开播那一刻判定一次录制时段，因此需要周期性兜住两个方向：
+	// LiveStart 回调只在开播那一刻判定一次，因此需要周期性兜住三个方向：
 	//  1) 开播在时段外、之后才进入时段 → 补建录制器，避免整场漏录；
 	//  2) 录制中到达时段的结束时刻 → 掐断录制（用户于 2026-09-30 变更的语义，
-	//     原先是"等它自然结束"）。
-	// 每分钟一次足够：方向 1 最多晚录 1 分钟，方向 2 最多多录 1 分钟。
+	//     原先是"等它自然结束"）；
+	//  3) 通用自愈：直播中却没有录制器的房间 → 补建（覆盖各种漏建录制器的路径）。
+	// 每分钟一次足够：方向 1/3 最多晚录 1 分钟，方向 2 最多多录 1 分钟。
 	recordScheduleCheckInterval = time.Minute
 )
 
@@ -452,14 +453,17 @@ func (m *manager) resolveRoomSchedule(cfg *configs.Config, room *configs.LiveRoo
 	return true, timeslot.IsActive(timeslot.Compile(slots), now)
 }
 
-// recordScheduleCatchUp 周期性地把"录制时间段"落到实际录制行为上，两个方向都管：
+// recordScheduleCatchUp 周期性地把"是否应当录制"落到实际录制行为上，三个方向都管：
 //
-//   - 时段开始：为"开播时不在时段、之后才进入时段"的直播间补建录制器
-//     （原先只做这件事，否则这类直播会整场漏录）；
+//   - 时段开始：为"开播时不在时段、之后才进入时段"的直播间补建录制器；
 //   - 时段结束：**掐断正在进行的录制**（用户 2026-09-30 变更的语义，原先是"等它自然结束"）。
 //     RemoveRecorder 内部走 recorder.Close()，当前片段会正常收尾并进入转码/后处理，
 //     不会留下损坏文件；下一次进入时段时若仍在直播，本函数会再补建录制器继续录，
-//     因此同一直播被切成多段是预期行为。
+//     因此同一直播被切成多段是预期行为；
+//   - **通用自愈**：任何房间只要"正在直播、应当录制、却没有录制器"，一律补建。
+//     这条兜底覆盖了"转为持久性 / 取消仅提醒 / 事件丢失 / 配置改动"等各种路径漏建录制器的情况，
+//     否则用户会看到"明明在直播却一直显示监控中"，只能等下一次重新开播。
+//     "用户主动要求不录制"的状态全部排除在外：未监听、仅提醒、待删除、以及时段外（见方向二）。
 //
 // 判定条件与 registryListener 完全一致，真正的重复保护仍由 addRecorderLocked
 // 在锁内完成（返回 ErrRecorderExist）。
@@ -488,14 +492,11 @@ func (m *manager) recordScheduleCatchUp(ctx context.Context) {
 		if err != nil || room == nil {
 			continue
 		}
-		// 只处理"配置了录制时段"的房间：未配时段的房间不受时间段约束。
+		// 录制时间段判定：未配置时段的房间不受时间段约束（hasSlots=false）
 		hasSlots, active := m.resolveRoomSchedule(cfg, room, now)
-		if !hasSlots {
-			continue
-		}
 
 		// ---- 方向一：时段已结束 → 掐断正在进行的录制 ----
-		if !active {
+		if hasSlots && !active {
 			if m.HasRecorder(ctx, id) {
 				if rerr := m.RemoveRecorder(ctx, id); rerr != nil {
 					// 并发下已被其它路径移除属于正常情况，不必刷错误日志
@@ -509,7 +510,16 @@ func (m *manager) recordScheduleCatchUp(ctx context.Context) {
 			continue
 		}
 
-		// ---- 方向二：时段内 → 为漏录的房间补建录制器 ----
+		// ---- 方向二：应当录制却没有录制器 → 补建（含通用自愈）----
+		//
+		// 这里不仅覆盖"开播在时段外、之后才进入时段"的补录，也是**通用自愈**：
+		// 任何导致"房间正在直播却没有录制器"的路径（转为持久性、取消仅提醒、事件丢失、
+		// 配置改动、软重启恢复不全……）都会在一分钟内被兜住。
+		// 若不做这层兜底，用户会看到"明明在直播却一直显示监控中"，只能等下次重新开播。
+		//
+		// 安全性：所有"用户主动要求不录制"的状态都已排除 ——
+		//   未监听（停止监控）、仅提醒、待删除（不可逆）、时段外（方向一已处理）。
+		// 手动"停止录制"按钮（stopRecordDirect）只对"仅提醒"房间开放，同样落在排除项里。
 		if m.HasRecorder(ctx, id) {
 			continue
 		}
@@ -533,11 +543,15 @@ func (m *manager) recordScheduleCatchUp(ctx context.Context) {
 		if err := m.AddRecorder(ctx, l); err != nil {
 			// 并发下已被 LiveStart 建好录制器属于正常情况，不必刷错误日志
 			if !errors.Is(err, ErrRecorderExist) {
-				l.GetLogger().Warnf("进入录制时间段后补建录制器失败: %v", err)
+				l.GetLogger().Warnf("直播中但缺少录制器，补建失败: %v", err)
 			}
 			continue
 		}
-		l.GetLogger().Info("已进入配置的录制时间段，补建录制器开始录制")
+		if hasSlots {
+			l.GetLogger().Info("已进入配置的录制时间段，补建录制器开始录制")
+		} else {
+			l.GetLogger().Info("检测到直播间正在直播但没有录制器，已自动补建并开始录制")
+		}
 	}
 }
 
